@@ -1,0 +1,6 @@
+{
+    "uuid": "macospills@ali120b.github.io",
+    "name": "macOS Caps Pill",
+    "description": "Shows a small macOS-style Caps Lock capsule at the text caret while Caps Lock is on. Caps state is read from the kernel LED; the caret comes from GNOME Shell's own IBus cursor tracking, so no accessibility switch is needed.",
+    "shell-version": ["51"]
+}

@@ -1,0 +1,4 @@
+[plugins.caret-bridge]
+name = "caret-bridge"
+description = "Publishes Wayland text caret for the macospills caps pill"
+repository = "local"

@@ -1,0 +1,12 @@
+/* macOS Caps Pill — light capsule, dark glyph, soft shadow. */
+.macospills-caps-pill {
+    background-color: #0a84ff;
+    border-radius: 15px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+    width: 46px;
+    height: 30px;
+}
+
+.macospills-caps-icon {
+    icon-size: 16px;
+}

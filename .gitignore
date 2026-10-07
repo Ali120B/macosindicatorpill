@@ -1,0 +1,16 @@
+# build outputs
+hyprland/caret-bridge/build/
+__pycache__/
+*.pyc
+*.so
+*.o
+
+# runtime state (lives in /tmp, never commit)
+*.log
+*.qslog
+
+# editor / OS
+.vscode/
+.idea/
+*~
+.DS_Store
