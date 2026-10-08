@@ -38,7 +38,6 @@ ShellRoot {
 
     // --- state --------------------------------------------------------
     property bool capsOn: false
-    property string lastAddr: ""
     property int px: 0
     property int py: 0
     property int showCalls: 0
@@ -51,10 +50,12 @@ ShellRoot {
     property int cy: bridge.y
     property int cw: bridge.w
     property int ch: bridge.h
+    property int caretWin: bridge.win
     property bool atCaret: root.capsOn && root.hasCaret
 
     onCapsOnChanged: root.applyState()
     onHasCaretChanged: root.applyState()
+    onCaretWinChanged: if (root.capsOn && root.capsOnFocus) pill.poke()
     onCxChanged: if (root.atCaret) root.updatePosition()
     onCyChanged: if (root.atCaret) root.updatePosition()
     onCwChanged: if (root.atCaret) root.updatePosition()
@@ -79,7 +80,11 @@ ShellRoot {
     }
 
     // Move only — never touches the fade. Called on every tick and
-    // every caret step; the x/y Behaviors glide the pill smoothly.
+    // every caret step; small typing steps glide, large jumps (tab /
+    // field switch) snap so the pill never slides from a stale pos.
+    // Positioned by capsule edge: pill x/y is the Item top-left but the
+    // visible capsule starts `margin` inside it, so the DESIGN.md 6px gap
+    // is capsule-to-caret, not margin-to-caret.
     // No caret (or caps off) -> hide: a pill with nowhere to point is
     // worse than none (same call as the KDE backend). There is no
     // bottom-center fallback anymore.
@@ -90,13 +95,26 @@ ShellRoot {
         }
         const mon = root.monitorFor(root.cx + root.cw / 2, root.cy);
         let x = Math.round(root.cx + root.cw / 2 - pill.implicitWidth / 2);
-        let y = Math.round(root.cy + root.ch + root.gap);
+        let y = Math.round(root.cy + root.ch + root.gap - pill.margin);
         if (y + pill.implicitHeight > mon.y + mon.height)
-            y = Math.round(root.cy - root.gap - pill.implicitHeight);
+            y = Math.round(root.cy - root.gap - pill.capsuleHeight - pill.margin);
         x = Math.max(mon.x, Math.min(mon.x + mon.width - pill.implicitWidth, x));
         y = Math.max(mon.y, Math.min(mon.y + mon.height - pill.implicitHeight, y));
+        const far = Math.hypot(x - pill.x, y - pill.y) > 80;
+        if (far) {
+            bx.enabled = false;
+            by.enabled = false;
+        }
         root.px = x;
         root.py = y;
+        if (far) {
+            // Re-enable next loop: same-frame re-enable still glides
+            // because the binding propagates after this JS returns.
+            Qt.callLater(function() {
+                bx.enabled = true;
+                by.enabled = true;
+            });
+        }
     }
 
     // Move + ensure visible. Called on real state transitions
@@ -124,18 +142,13 @@ ShellRoot {
 
     Process {
         id: pollProc
-        command: ["bash", "-c", "n=$(cat /sys/class/leds/*capslock/brightness 2>/dev/null | grep -c 1); if [ \"$n\" -gt 0 ]; then echo caps=1; else echo caps=0; fi; hyprctl activewindow -j 2>/dev/null | grep -o '\"address\": \"[^\"]*\"' | head -n1"]
+        // Caps LED only (cheap `cat`). Focus changes come event-driven
+        // from the bridge `win` sequence — no more `hyprctl` fork here.
+        command: ["bash", "-c", "n=$(cat /sys/class/leds/*capslock/brightness 2>/dev/null | grep -c 1); if [ \"$n\" -gt 0 ]; then echo caps=1; else echo caps=0; fi"]
         stdout: StdioCollector {
             onStreamFinished: {
-                const lines = this.text.trim().split("\n");
-                const m = /caps=(\d)/.exec(lines[0] || "");
+                const m = /caps=(\d)/.exec(this.text.trim() || "");
                 const on = !!(m && m[1] === "1");
-                const addr = (lines.length > 1 ? lines[1] : "").trim();
-                if (addr && addr !== root.lastAddr) {
-                    root.lastAddr = addr;
-                    if (on && root.capsOnFocus && root.capsOn)
-                        pill.poke();
-                }
                 root.setCaps(on);
                 // Reconciler: move every tick (smooth follow, no fade
                 // restart), and re-show if the pill should be up but
@@ -167,8 +180,9 @@ ShellRoot {
     }
 
     // bridge caret file (sole source)
-    // file shape: {"hasCaret":bool,"x","y","w","h"} maps 1:1
-    // ("why"/"app" keys are diagnostics, ignored here)
+    // file shape: {"hasCaret":bool,"x","y","w","h","win"} maps 1:1
+    // ("why"/"app" keys are diagnostics, ignored here; "win" is the
+    // focus-generation counter driving the poke() above)
     FileView {
         path: "/tmp/macospills-hypr-caret.json"
         watchChanges: true
@@ -180,6 +194,7 @@ ShellRoot {
             property int y: 0
             property int w: 0
             property int h: 0
+            property int win: 0
         }
     }
 
@@ -197,6 +212,7 @@ ShellRoot {
                 hasCaret: root.hasCaret,
                 atCaret: root.atCaret,
                 cx: root.cx, cy: root.cy, cw: root.cw, ch: root.ch,
+                win: root.caretWin,
                 px: root.px, py: root.py,
                 showing: pill.showing,
                 opacity: pill.opacity,
@@ -228,14 +244,16 @@ ShellRoot {
             x: root.px
             y: root.py
             Behavior on x {
+                id: bx
                 NumberAnimation {
-                    duration: 120
+                    duration: 60
                     easing.type: Easing.OutCubic
                 }
             }
             Behavior on y {
+                id: by
                 NumberAnimation {
-                    duration: 120
+                    duration: 60
                     easing.type: Easing.OutCubic
                 }
             }

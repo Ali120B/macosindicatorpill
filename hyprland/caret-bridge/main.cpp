@@ -30,6 +30,7 @@
 #undef private
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -58,9 +59,11 @@ constexpr auto STALE_TTL = std::chrono::seconds(5);
 constexpr auto ACTIVE_TTL = std::chrono::seconds(5);
 // A window-title change with no commit near it means navigation, not
 // typing side-effects (those land within ~ms of their commit) -> old
-// boxes die now. Kept at 500ms, not lower, so slow IPC delivery of a
-// title still counts as typing-related.
-constexpr auto TITLE_QUIET = std::chrono::milliseconds(500);
+// boxes die now. Kept at 150ms, not lower, so slow IPC delivery of a
+// title still counts as typing-related. Larger values (500ms) hid real
+// Ctrl-Tab switches made shortly after typing: the old tab's fresh box
+// stayed alive and won in the new tab.
+constexpr auto TITLE_QUIET = std::chrono::milliseconds(150);
 // A focus (enable) this fresh outranks box recency: focus just arrived
 // here, show this field's last-known caret even if its box is older
 // than another field's. Bounds spurious-enable damage to this window.
@@ -81,6 +84,20 @@ struct STrackedV3 {
     CBox lastBox;
     bool hasBox = false;
     std::chrono::steady_clock::time_point boxSeenAt{};
+    // surrounding-text identity: Gecko reuses one object across tabs,
+    // so an empty box after a text replace is a new tab, not select-all.
+    bool hasText = false;
+    size_t lastTextHash = 0;
+    size_t lastTextLen = 0;
+    uint32_t lastCursor = 0;
+    uint32_t lastAnchor = 0;
+    // text identity when lastBox was recorded
+    size_t boxTextHash = 0;
+    size_t boxTextLen = 0;
+    bool boxTextValid = false;
+    // live box contradicted the text this probe (e.g. backspace shrank
+    // the text but the rect jumped right): hold lastBox, emit that.
+    bool holdBox = false;
     CHyprSignalListener commit, enable, disable, destroy;
 };
 
@@ -99,7 +116,14 @@ struct STrackedV1 {
 struct SCachedCaret {
     CBox box;
     std::chrono::steady_clock::time_point seenAt;
+    size_t textHash = 0;
+    size_t textLen = 0;
+    bool hasText = false;
 };
+
+static size_t textHashOf(const std::string& s) {
+    return std::hash<std::string>{}(s);
+}
 
 static std::vector<UP<STrackedV3>> g_v3;
 static std::vector<UP<STrackedV1>> g_v1;
@@ -115,6 +139,14 @@ static wl_event_source* s_timer = nullptr;
 static uint64_t s_timerCount = 0;
 
 static std::string g_lastJson;
+// Focus-generation counter: bumped on window/workspace/monitor/surface
+// focus changes so the overlay can re-pop (poke) event-driven instead
+// of polling `hyprctl activewindow`.
+static uint64_t g_winSeq = 0;
+// Last focused-window title: substantial renames mean navigation even
+// with a nearby commit (Ctrl-Tab right after typing); tiny mutations
+// (dirty `*` markers, counts) are typing churn and ignored.
+static std::string g_lastWinTitle;
 
 constexpr const char* LOG_PATH = "/tmp/macospills-caret.log";
 
@@ -167,22 +199,39 @@ static void publish(const std::string& js) {
 }
 
 static void publishNull(const std::string& why, const std::string& app) {
-    char buf[256];
+    char buf[384];
     std::snprintf(buf, sizeof(buf),
                   "{\"hasCaret\":false,\"x\":0,\"y\":0,\"w\":0,\"h\":0,"
-                  "\"why\":\"%s\",\"app\":\"%s\"}",
-                  why.c_str(), app.c_str());
+                  "\"why\":\"%s\",\"app\":\"%s\",\"win\":%llu}",
+                  why.c_str(), app.c_str(),
+                  (unsigned long long)g_winSeq);
     publish(buf);
 }
 
 static void publishCaret(int x, int y, int w, int h, const std::string& why,
                          const std::string& app) {
-    char buf[256];
+    char buf[384];
     std::snprintf(buf, sizeof(buf),
                   "{\"hasCaret\":true,\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,"
-                  "\"why\":\"%s\",\"app\":\"%s\"}",
-                  x, y, w, h, why.c_str(), app.c_str());
+                  "\"why\":\"%s\",\"app\":\"%s\",\"win\":%llu}",
+                  x, y, w, h, why.c_str(), app.c_str(),
+                  (unsigned long long)g_winSeq);
     publish(buf);
+}
+
+// Rough edit size between two window titles (common prefix+suffix
+// trimmed). Typing churn mutates a couple of chars; navigation renames.
+static size_t titleEditSize(const std::string& a, const std::string& b) {
+    if (a == b)
+        return 0;
+    size_t pre = 0;
+    while (pre < a.size() && pre < b.size() && a[pre] == b[pre])
+        ++pre;
+    size_t suf = 0;
+    while (suf < a.size() - pre && suf < b.size() - pre &&
+           a[a.size() - 1 - suf] == b[b.size() - 1 - suf])
+        ++suf;
+    return (a.size() - pre - suf) + (b.size() - pre - suf);
 }
 
 static std::string focusApp() {
@@ -229,6 +278,27 @@ static void probeAndPublish() {
         return;
     }
 
+    // Live relay snapshot (compositor-blessed focus, queried now — not
+    // stale). Lets an idle-but-still-focused caret survive ACTIVE_TTL:
+    // a held pill must not vanish while reading. Silent blurs clear the
+    // relay, so those still hide.
+    CBox relayBox{};
+    bool relayOk = false;
+    try {
+        if (auto* relay = g_pInputManager->m_relay.getFocusedTextInput()) {
+            if (relay->focusedSurface() == focusSurface &&
+                relay->isEnabled() && relay->hasCursorRectangle()) {
+                CBox c = relay->cursorBox();
+                if (c.w > 0 || c.h > 0) {
+                    relayBox = c;
+                    relayOk = true;
+                }
+            }
+        }
+    } catch (...) {
+        relayOk = false;
+    }
+
     // Policy: freshest RECT wins among enabled direct inputs. Commit
     // recency alone lied: an enable/commit can arrive for a field switch
     // while m_current still holds the previous field's box, so ordering
@@ -247,6 +317,9 @@ static void probeAndPublish() {
     const auto now = std::chrono::steady_clock::now();
     auto sameBox = [](const CBox& a, const CBox& b) {
         return a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h;
+    };
+    auto boxesClose = [](const CBox& a, const CBox& b) {
+        return std::fabs(a.x - b.x) + std::fabs(a.y - b.y) <= 8;
     };
     auto alive = [&](std::chrono::steady_clock::time_point commit,
                      std::chrono::steady_clock::time_point enable) {
@@ -280,12 +353,87 @@ static void probeAndPublish() {
     // client's objects. Gates the relay below (which carries no
     // timestamps of its own).
     auto clientMark = std::chrono::steady_clock::time_point{};
+    // Surrounding-text identity for this client this probe: Gecko reuses
+    // one text-input object across tabs, so a text replace without a
+    // fresh box means the field changed (Ctrl-T), not typing.
+    bool clientHasText = false;
+    size_t clientTextHash = 0;
+    size_t clientTextLen = 0;
+    uint64_t clientTextAct = 0;
+    bool textSwitchedWithoutBox = false;
+    bool anyBoxUpdatedNow = false;
     for (auto& t : g_v3) {
         auto in = t->input.lock();
         if (!in || in->client() != focusSurface->client())
             continue;
         sameClientV3++;
         clientMark = std::max({clientMark, t->lastCommit, t->lastEnable});
+        // Track surrounding text before looking at the box. m_current
+        // keeps the last committed values, so compare content: a hash/len
+        // change means new text even when the box didn't re-commit.
+        size_t curHash = 0;
+        size_t curLen = 0;
+        uint32_t curCursor = 0;
+        uint32_t curAnchor = 0;
+        bool surKnown = false;
+        try {
+            const auto& sur = in->m_current.surrounding;
+            if (sur.updated) {
+                curLen = sur.text.size();
+                curHash = textHashOf(sur.text);
+                curCursor = sur.cursor;
+                curAnchor = sur.anchor;
+                surKnown = true;
+            }
+        } catch (...) {
+            surKnown = false;
+        }
+        if (surKnown) {
+            if (!t->hasText) {
+                t->hasText = true;
+                t->lastTextHash = curHash;
+                t->lastTextLen = curLen;
+                t->lastCursor = curCursor;
+                t->lastAnchor = curAnchor;
+            } else if (curHash != t->lastTextHash ||
+                       curLen != t->lastTextLen) {
+                // Text replaced (tab switch, field clear). Typing also
+                // changes text, but typing always ships a fresh
+                // non-empty box alongside — handled below.
+                bool boxFresh = in->m_current.box.updated &&
+                    (in->m_current.box.cursorBox.w > 0 ||
+                     in->m_current.box.cursorBox.h > 0);
+                t->lastTextHash = curHash;
+                t->lastTextLen = curLen;
+                t->lastCursor = curCursor;
+                t->lastAnchor = curAnchor;
+                if (t->lastActivity >= clientTextAct) {
+                    clientHasText = true;
+                    clientTextHash = curHash;
+                    clientTextLen = curLen;
+                    clientTextAct = t->lastActivity;
+                }
+                if (!boxFresh) {
+                    // New text, no caret for it yet (e.g. Ctrl-T to an
+                    // empty bar reusing the same object): drop the old
+                    // box now instead of holding it until typing.
+                    t->hasBox = false;
+                    textSwitchedWithoutBox = true;
+                    continue;
+                }
+                // else: text+box changed together = steady typing,
+                // fall through to the normal box update.
+            } else {
+                t->lastCursor = curCursor;
+                t->lastAnchor = curAnchor;
+            }
+            if (t->lastActivity >= clientTextAct) {
+                clientHasText = true;
+                clientTextHash = curHash;
+                clientTextLen = curLen;
+                clientTextAct = t->lastActivity;
+            }
+        }
         if (!in->m_current.box.updated)
             continue;
         auto c = in->m_current.box.cursorBox;
@@ -298,9 +446,48 @@ static void probeAndPublish() {
         if (!empty) {
             updatedV3++;
             if (!t->hasBox || !sameBox(c, t->lastBox)) {
-                t->lastBox = c;
-                t->hasBox = true;
-                t->boxSeenAt = now;
+                // Single-line directional sanity: on a staggered
+                // text+box pair the live rect must agree with the length
+                // delta (shrink => not right, grow => not left). A
+                // contradicting commit (Zen backspace transient) holds
+                // the old box for this probe instead of jumping wrong.
+                bool contradict = false;
+                if (t->hasBox && t->hasText && surKnown && t->boxTextValid &&
+                    c.y == t->lastBox.y) {
+                    if (curLen < t->boxTextLen && c.x > t->lastBox.x + 2)
+                        contradict = true;
+                    else if (curLen > t->boxTextLen && c.x + 2 < t->lastBox.x)
+                        contradict = true;
+                }
+                if (contradict) {
+                    t->holdBox = true;
+                } else {
+                    t->lastBox = c;
+                    t->hasBox = true;
+                    t->holdBox = false;
+                    t->boxSeenAt = now;
+                    anyBoxUpdatedNow = true;
+                    if (t->hasText) {
+                        t->boxTextHash = t->lastTextHash;
+                        t->boxTextLen = t->lastTextLen;
+                        t->boxTextValid = true;
+                    }
+                }
+            } else {
+                t->holdBox = false;
+                if (t->hasText && surKnown) {
+                    // staggered text-follow commit: same caret, new text —
+                    // rebind so the next delta compares to fresh text.
+                    t->boxTextHash = curHash;
+                    t->boxTextLen = curLen;
+                    t->boxTextValid = true;
+                } else if (t->hasText && !t->boxTextValid) {
+                    // box predates text tracking: bind it to current text
+                    // so a later empty-after-replace can tell them apart.
+                    t->boxTextHash = t->lastTextHash;
+                    t->boxTextLen = t->lastTextLen;
+                    t->boxTextValid = true;
+                }
             }
         }
         auto fresher = [&](auto otherBox, auto otherAct) {
@@ -311,6 +498,14 @@ static void probeAndPublish() {
             enabledV3++;
             if (empty) {
                 emptyV3++;
+                // Empty after a text replace was already handled above
+                // (invalidated + textSwitchedWithoutBox). What remains
+                // here is a genuinely collapsed caret: only hold it when
+                // the text is unchanged and there is a selection
+                // (Ctrl-A collapse). A steady empty field (no selection)
+                // must hide, not hold the old pos.
+                if (t->hasText && t->lastCursor == t->lastAnchor)
+                    continue;
                 if (t->lastCommit > t->lastDisable &&
                     now - t->lastCommit <= STALE_TTL &&
                     (!emptyT || t->lastActivity >= emptyActV3)) {
@@ -381,12 +576,28 @@ static void probeAndPublish() {
     }
 
     auto emitBox = [&](const CBox& c, const std::string& why) {
-        g_cache[focusSurface->client()] = {c, now};
+        SCachedCaret cc;
+        cc.box = c;
+        cc.seenAt = now;
+        cc.hasText = clientHasText;
+        cc.textHash = clientTextHash;
+        cc.textLen = clientTextLen;
+        g_cache[focusSurface->client()] = cc;
         publishCaret((int)std::round(sbox->x + c.x),
                      (int)std::round(sbox->y + c.y),
                      (int)std::round(c.w <= 0 ? 2 : c.w),
                      (int)std::round(c.h <= 0 ? 20 : c.h), why, app);
     };
+
+    // Same-object tab switch (Gecko reuses the URL-bar input): the text
+    // was replaced but no caret arrived for the new text. Hiding now is
+    // correct; holding the old tab's box is the reported bug. Exception:
+    // a box updated in this very probe alongside the text = steady
+    // typing, let it win below.
+    if (textSwitchedWithoutBox && !anyBoxUpdatedNow) {
+        publishNull("field-switch-text", app);
+        return;
+    }
 
     // 1. enabled direct winner. Fresh focus outranks fresh box: an
     // enable within FOCUS_FRESH means "focus just arrived here" even if
@@ -401,7 +612,21 @@ static void probeAndPublish() {
     std::chrono::steady_clock::time_point winV3Box{};
     uint64_t winActV3 = 0;
     const char* winWhy = "direct-v3";
+    // Focus-fresh winner must also be text-consistent: if its box was
+    // recorded for older text (tab navigated, same object reused), the
+    // box is stale even though the enable is fresh. Fall back to box
+    // recency / hide instead of showing the opposite tab's pos.
+    bool focusValid = false;
     if (focusV3 && now - focusV3T->lastEnable <= FOCUS_FRESH) {
+        focusValid = true;
+        if (focusV3T->hasText && focusV3T->hasBox && focusV3T->boxTextValid &&
+            (focusV3T->boxTextHash != focusV3T->lastTextHash ||
+             focusV3T->boxTextLen != focusV3T->lastTextLen))
+            focusValid = false;
+        if (!focusV3T->hasBox)
+            focusValid = false;
+    }
+    if (focusValid) {
         winV3 = focusV3;
         winV3T = focusV3T;
         winV3Box = focusV3Box;
@@ -415,7 +640,16 @@ static void probeAndPublish() {
     }
     bool v3Wins = winV3 && (!bestV1 || winV3Box > bestV1Box ||
                             (winV3Box == bestV1Box && winActV3 >= actV1));
-    if (v3Wins && alive(winV3T->lastCommit, winV3T->lastEnable)) {
+    bool timeAlive = v3Wins && alive(winV3T->lastCommit, winV3T->lastEnable);
+    // Idle hold: past ACTIVE_TTL but the relay still reports the same
+    // rect right now on this surface, with no trailing disable and no
+    // navigation since the last commit. Reading, not blurred.
+    bool relayConfirm = false;
+    if (v3Wins && !timeAlive && relayOk &&
+        winV3T->lastCommit >= g_lastTitleChange &&
+        !(winV3T->lastDisable > winV3T->lastCommit))
+        relayConfirm = boxesClose(winV3->m_current.box.cursorBox, relayBox);
+    if (v3Wins && (timeAlive || relayConfirm)) {
         // field-switch guard: a DIFFERENT same-client object was enabled
         // strictly after the winner's box last changed -> focus moved to
         // a field that hasn't committed a box yet; hide instead of showing
@@ -432,7 +666,12 @@ static void probeAndPublish() {
                 return;
             }
         }
-        emitBox(winV3->m_current.box.cursorBox, winWhy);
+        if (winV3T->holdBox && winV3T->hasBox) {
+            emitBox(winV3T->lastBox, "held-transient");
+            return;
+        }
+        emitBox(winV3->m_current.box.cursorBox,
+                timeAlive ? winWhy : "direct-v3-idle");
         return;
     }
     if (bestV1 && alive(bestV1T->lastCommit, bestV1T->lastSeen)) {
@@ -447,9 +686,17 @@ static void probeAndPublish() {
     // 1c. enabled but empty box (select-all hold): hold this field's
     // OWN last box, not the client cache (which may hold another
     // field's pos — e.g. a brand-new empty tab must hide, not show the
-    // old tab's caret). Holds while its commits keep flowing.
+    // old tab's caret). Holds while its commits keep flowing, and only
+    // while the text still matches the text the box was seen with
+    // (tab clear changes text -> hide, handled above).
     if (emptyT && emptyT->lastCommit >= g_lastTitleChange &&
         emptyT->hasBox) {
+        if (emptyT->hasText && emptyT->boxTextValid &&
+            (emptyT->lastTextHash != emptyT->boxTextHash ||
+             emptyT->lastTextLen != emptyT->boxTextLen)) {
+            publishNull("empty-tab-hide", app);
+            return;
+        }
         emitBox(emptyT->lastBox, "selection-hold");
         return;
     }
@@ -461,17 +708,9 @@ static void probeAndPublish() {
     // and after the last title change.
     bool clientAlive = clientMark >= g_lastTitleChange &&
         now - clientMark <= ACTIVE_TTL;
-    if (clientAlive) {
-        if (auto* relay = g_pInputManager->m_relay.getFocusedTextInput()) {
-            if (relay->focusedSurface() == focusSurface && relay->isEnabled() &&
-                relay->hasCursorRectangle()) {
-                CBox c = relay->cursorBox();
-                if (c.w > 0 || c.h > 0) {
-                    emitBox(c, "relay");
-                    return;
-                }
-            }
-        }
+    if (clientAlive && relayOk) {
+        emitBox(relayBox, "relay");
+        return;
     }
 
     // 4. short same-client cache (covers transient protocol gaps) —
@@ -479,6 +718,8 @@ static void probeAndPublish() {
     // cached caret means the field was vacated after we published it,
     // so hide now instead of lingering on the cache. The disable
     // listener already re-probes synchronously, making hides instant.
+    // Also never across a text replace: the cached box belongs to the
+    // old text (old tab), not the current one.
     {
         auto it = g_cache.find(focusSurface->client());
         if (it != g_cache.end() &&
@@ -494,7 +735,14 @@ static void probeAndPublish() {
                     break;
                 }
             }
-            if (!vacated) {
+            bool textMismatch = false;
+            if (!vacated && it->second.hasText && clientHasText &&
+                (it->second.textHash != clientTextHash ||
+                 it->second.textLen != clientTextLen))
+                textMismatch = true;
+            if (textSwitchedWithoutBox)
+                textMismatch = true;
+            if (!vacated && !textMismatch) {
                 auto c = it->second.box;
                 publishCaret((int)std::round(sbox->x + c.x),
                              (int)std::round(sbox->y + c.y),
@@ -615,7 +863,7 @@ static std::string dumpInputs(eHyprCtlOutputFormat, std::string) {
     out += "timerTicks=" + std::to_string(s_timerCount) + "\n";
     auto focusClient = Desktop::focusState()->surface() ?
         Desktop::focusState()->surface()->client() : nullptr;
-    char line[256];
+    char line[320];
     for (auto& t : g_v3) {
         auto in = t->input.lock();
         if (!in)
@@ -624,12 +872,15 @@ static std::string dumpInputs(eHyprCtlOutputFormat, std::string) {
         const auto& c = st.box.cursorBox;
         std::snprintf(line, sizeof(line),
                       "%cv3 client=%p en=%d upd=%d box=(%.0f,%.0f %.0fx%.0f) "
-                      "actAge=%ldms boxAge=%ldms commitAge=%ldms disAge=%ldms\n",
+                      "actAge=%ldms boxAge=%ldms commitAge=%ldms disAge=%ldms "
+                      "txtLen=%zu cur=%u anch=%u surUpd=%d\n",
                       (focusClient && in->client() == focusClient) ? '>' : ' ',
                       (void*)in->client(), (int)st.enabled.value,
                       (int)st.box.updated, c.x, c.y, c.w, c.h,
                       ageMs(t->lastSeen), ageMs(t->boxSeenAt),
-                      ageMs(t->lastCommit), ageMs(t->lastDisable));
+                      ageMs(t->lastCommit), ageMs(t->lastDisable),
+                      st.surrounding.text.size(), (unsigned)st.surrounding.cursor,
+                      (unsigned)st.surrounding.anchor, (int)st.surrounding.updated);
         out += line;
     }
     for (auto& t : g_v1) {
@@ -689,27 +940,47 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO pluginInit(HANDLE handle) {
     }
 
     s_kbFocus = Event::bus()->m_events.input.keyboard.focus.listen(
-        [](SP<CWLSurfaceResource>) { probeAndPublish(); });
+        [](SP<CWLSurfaceResource>) {
+            ++g_winSeq;
+            probeAndPublish();
+        });
     s_winActive = Event::bus()->m_events.window.active.listen(
-        [](PHLWINDOW, Desktop::eFocusReason) { probeAndPublish(); });
+        [](PHLWINDOW, Desktop::eFocusReason) {
+            ++g_winSeq;
+            probeAndPublish();
+        });
     // Focus can move without any text-input/keyboard event (workspace
     // switch to an empty workspace, window close/minimize leaving no
     // focus): re-probe on those too, or the old rect lingers instead of
     // hiding.
     s_wsActive = Event::bus()->m_events.workspace.active.listen(
-        [](PHLWORKSPACE) { probeAndPublish(); });
+        [](PHLWORKSPACE) {
+            ++g_winSeq;
+            probeAndPublish();
+        });
     s_monFocused = Event::bus()->m_events.monitor.focused.listen(
-        [](PHLMONITOR) { probeAndPublish(); });
+        [](PHLMONITOR) {
+            ++g_winSeq;
+            probeAndPublish();
+        });
     s_winClose = Event::bus()->m_events.window.close.listen(
         [](PHLWINDOW) { probeAndPublish(); });
-    // Title change with no commit near it = navigation, not typing:
-    // the old field is gone even though it never disabled. Typing
-    // side-effects (per-keystroke title churn) commit within ~1s, so
-    // those titles are ignored.
+    // Title change: substantial renames mean navigation even with a
+    // nearby commit (Ctrl-Tab right after typing); tiny mutations are
+    // typing churn and only count when isolated (no commit near them).
+    // Typing side-effects land within ~ms of their commit.
     s_winTitle = Event::bus()->m_events.window.title.listen(
-        [](PHLWINDOW) {
+        [](PHLWINDOW w) {
             auto now = std::chrono::steady_clock::now();
-            if (now - g_lastGlobalCommit > TITLE_QUIET)
+            std::string t;
+            try {
+                t = w ? w->m_title : "";
+            } catch (...) {
+                t = "";
+            }
+            bool nav = titleEditSize(g_lastWinTitle, t) > 3;
+            g_lastWinTitle = t;
+            if (nav || now - g_lastGlobalCommit > TITLE_QUIET)
                 g_lastTitleChange = now;
             probeAndPublish();
         });
@@ -734,6 +1005,17 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO pluginInit(HANDLE handle) {
                     },
                 });
 
+    // Statics survive dlclose/dlopen: force a fresh publish so the state
+    // file exists right after (re)load instead of waiting for the next
+    // caret change (QML FileView warns until then).
+    g_lastJson.clear();
+    g_lastGlobalCommit = std::chrono::steady_clock::time_point{};
+    g_lastTitleChange = std::chrono::steady_clock::time_point{};
+    try {
+        if (auto w = Desktop::focusState()->window())
+            g_lastWinTitle = w->m_title;
+    } catch (...) {
+    }
     probeAndPublish();
 
     HyprlandAPI::addNotification(handle, "[macospills] caret-bridge loaded",

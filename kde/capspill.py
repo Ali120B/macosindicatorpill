@@ -66,21 +66,47 @@ def read_brightness(path):
         return False
 
 
-def output_scale():
-    """Logical scale of the first enabled output (kscreen-doctor)."""
+def output_layout():
+    """Enabled outputs as [(x, y, w, h, scale)] from kscreen-doctor.
+
+    Geometry line formats differ across versions — try several patterns;
+    blocks with a Scale but no parseable geometry keep None geometry and
+    serve as scale fallback (old first-output behavior). Never raises.
+    """
     try:
         out = subprocess.run(
             ["kscreen-doctor", "-o"], capture_output=True, text=True, timeout=5
         ).stdout
         clean = re.sub(r"\x1b\[[0-9;]*m", "", out)
+        res = []
         for block in clean.split("Output:")[1:]:
             if "enabled" not in block.split("\n", 2)[1]:
                 continue
             m = re.search(r"Scale:\s*([\d.]+)", block)
-            if m:
-                return float(m.group(1))
+            if not m:
+                continue
+            scale = float(m.group(1))
+            g = (re.search(r"Geometry:\s*(-?\d+),(-?\d+)\s+(\d+)x(\d+)", block) or
+                 re.search(r"Geometry:\s*(-?\d+)\s+(-?\d+)\s+(\d+)\s*[xX]\s*(\d+)",
+                            block) or
+                 re.search(r"Position:\s*(-?\d+),(-?\d+)", block))
+            if g and len(g.groups()) >= 4:
+                res.append((int(g.group(1)), int(g.group(2)),
+                            int(g.group(3)), int(g.group(4)), scale))
+            elif g and len(g.groups()) >= 2:
+                res.append((int(g.group(1)), int(g.group(2)), 0, 0, scale))
+            else:
+                res.append((None, None, None, None, scale))
+        return res
     except Exception:
-        pass
+        return []
+
+
+def output_scale():
+    """Logical scale of the first enabled output (fallback)."""
+    outs = output_layout()
+    if outs:
+        return outs[0][4] or 1.0
     return 1.0
 
 
@@ -100,6 +126,8 @@ class Daemon:
     def __init__(self):
         self.leds = sorted(glob.glob("/sys/class/leds/*capslock/brightness"))
         self.scale = output_scale()
+        self.outputs = output_layout()
+        self.outputs_at = time.time()
         self.caps = None
         self.win = None  # (fx,fy,fw,fh,cx,cy,app_id)
         self.last_json = ""
@@ -150,6 +178,24 @@ class Daemon:
             self.qs_proc = None
 
     # --- state -------------------------------------------------------
+
+    def scale_at(self, x, y):
+        """Scale of the output containing (x, y); layout refreshes at
+        most every 60 s (hotplug) so polls stay cheap."""
+        try:
+            if time.time() - self.outputs_at > 60:
+                self.outputs = output_layout()
+                self.outputs_at = time.time()
+            for ox, oy, ow, oh, s in self.outputs:
+                if ox is None:
+                    continue
+                if ow and oh and not (ox <= x < ox + ow and oy <= y < oy + oh):
+                    continue
+                if s:
+                    return s
+        except Exception:
+            pass
+        return self.scale or 1.0
 
     def on_window(self, fx, fy, fw, fh, cx, cy, app_id, caption):
         app_id = str(app_id)
@@ -347,7 +393,9 @@ class Daemon:
                 return None
             ox = cx if cx >= 0 else fx
             oy = cy if cy >= 0 else fy
-            s = self.scale or 1.0
+            # Per-monitor scale (window center), not the first output's:
+            # mixed-DPI second-monitor carets were off by the ratio.
+            s = self.scale_at(fx + fw / 2, fy + fh / 2)
             if nchars > 0:
                 try:
                     caret = ti.get_caret_offset()
