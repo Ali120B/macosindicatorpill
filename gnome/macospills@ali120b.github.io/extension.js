@@ -168,8 +168,8 @@ export default class MacospillsCapsPill extends Extension {
                 this._updateWant();
             });
         // Clicks move the caret with no keypress (same-surface fields
-        // send no focus event): turn the arming generation so the
-        // arrival only snapshots — strict first-key rule.
+        // send no focus event): reset arming so the arrival only
+        // snapshots — strict first-key rule.
         this._stageClickId = global.stage.connect(
             'button-press-event', () => this._resetArm());
         this._trackFocusedActor();
@@ -475,7 +475,7 @@ export default class MacospillsCapsPill extends Extension {
 
     // --- layout flash -------------------------------------------------
 
-    _shortSourceId(type, id) {
+    _shortSourceId(id) {
         const base = String(id).split('+')[0].toUpperCase();
         return base.slice(0, 6) || '?';
     }
@@ -485,11 +485,11 @@ export default class MacospillsCapsPill extends Extension {
             const st = this._layoutSettings;
             const mru = st.get_value('mru-sources').deep_unpack();
             if (mru.length)
-                return this._shortSourceId(mru[0][0], mru[0][1]);
+                return this._shortSourceId(mru[0][1]);
             const sources = st.get_value('sources').deep_unpack();
             const cur = st.get_uint('current');
             if (sources[cur])
-                return this._shortSourceId(sources[cur][0], sources[cur][1]);
+                return this._shortSourceId(sources[cur][1]);
         } catch {
             // schema without sources (locked-down session)
         }
@@ -567,20 +567,16 @@ export default class MacospillsCapsPill extends Extension {
     }
 
     _place() {
-        let x, y, mon;
-        if (this._caret) {
-            const c = this._caret;
-            mon = this._monitorFor(c.x + c.w / 2, c.y);
-            x = Math.round(c.x + c.w / 2 - PILL_W / 2);
-            y = Math.round(c.y + c.h + GAP);
-            if (y + PILL_H > mon.y + mon.height)
-                y = Math.round(c.y - GAP - PILL_H);
-        } else {
-            mon = Main.layoutManager.monitors[
-                global.display.get_current_monitor()] ?? Main.layoutManager.primaryMonitor;
-            x = Math.round(mon.x + (mon.width - PILL_W) / 2);
-            y = Math.round(mon.y + mon.height * 0.92 - PILL_H);
-        }
+        // Caret required (callers with none hide right after via
+        // _updateWant); never throw on null into signal handlers.
+        if (!this._caret)
+            return;
+        const c = this._caret;
+        const mon = this._monitorFor(c.x + c.w / 2, c.y);
+        let x = Math.round(c.x + c.w / 2 - PILL_W / 2);
+        let y = Math.round(c.y + c.h + GAP);
+        if (y + PILL_H > mon.y + mon.height)
+            y = Math.round(c.y - GAP - PILL_H);
         x = Math.max(mon.x, Math.min(mon.x + mon.width - PILL_W, x));
         y = Math.max(mon.y, Math.min(mon.y + mon.height - PILL_H, y));
         this._pill.set_position(x, y);

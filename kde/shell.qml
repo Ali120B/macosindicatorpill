@@ -1,11 +1,12 @@
 //@ pragma UseQApplication
 // macospills KDE overlay — full-screen click-through layer with a pill
-// that eases to the caret (smooth follow) or the on-screen fallback.
+// that eases to the caret (smooth follow).
 //
 // Driven by capspill.py via /tmp/macospills-kde.json (FileView watch):
 //   {"caps": bool, "hasCaret": bool, "cx","cy","cw","ch": int}
 // Placement mirrors DESIGN.md: below the caret (6px gap), above when no
-// room, clamped to the monitor; bottom-center fallback without a caret.
+// room, clamped to the monitor. No caret: hidden (same call as Hyprland,
+// the daemon sends hide:true — there is no on-screen fallback).
 
 import Quickshell
 import Quickshell.Wayland
@@ -15,7 +16,6 @@ import QtQuick
 ShellRoot {
     id: root
 
-    property int edgeGap: 86
     property int gap: 6
     property int px: 0
     property int py: 0
@@ -140,24 +140,19 @@ ShellRoot {
     // used to call applyState()->show(), restarting the 90ms fade from 0
     // each keystroke so the pill never reached full opacity. Positioned
     // by capsule edge (see hyprland/shell.qml): the 6px gap is
-    // capsule-to-caret.
+    // capsule-to-caret. Callers guarantee atCaret (armed + caret up).
     function updatePosition() {
-        if (!root.capsOn || root.hideIt) {
+        if (!root.atCaret) {
             pill.hide();
             return;
         }
-        let mon, x, y;
-        if (root.atCaret) {
-            mon = root.monitorFor(root.cx + root.cw / 2, root.cy);
-            x = Math.round(root.cx + root.cw / 2 - pill.implicitWidth / 2);
-            y = Math.round(root.cy + root.ch + root.gap - pill.margin);
-            if (y + pill.implicitHeight > mon.y + mon.height)
-                y = Math.round(root.cy - root.gap - pill.capsuleHeight - pill.margin);
-        } else {
-            mon = Quickshell.screens.length ? Quickshell.screens[0] : ({x: 0, y: 0, width: 1920, height: 1080});
-            x = Math.round(mon.x + (mon.width - pill.implicitWidth) / 2);
-            y = Math.round(mon.y + mon.height * 0.92 - pill.implicitHeight);
-        }
+        const mon = root.monitorFor(root.cx + root.cw / 2, root.cy);
+        let x = Math.round(root.cx + root.cw / 2 - pill.implicitWidth / 2);
+        let y = Math.round(root.cy + root.ch + root.gap - pill.margin);
+        if (y + pill.implicitHeight > mon.y + mon.height)
+            y = Math.round(root.cy - root.gap - pill.capsuleHeight - pill.margin);
+        x = Math.max(mon.x, Math.min(mon.x + mon.width - pill.implicitWidth, x));
+        y = Math.max(mon.y, Math.min(mon.y + mon.height - pill.implicitHeight, y));
         x = Math.max(mon.x, Math.min(mon.x + mon.width - pill.implicitWidth, x));
         y = Math.max(mon.y, Math.min(mon.y + mon.height - pill.implicitHeight, y));
         const far = Math.hypot(x - pill.x, y - pill.y) > 80;
