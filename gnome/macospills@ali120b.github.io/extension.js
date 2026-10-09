@@ -518,13 +518,18 @@ export default class MacospillsCapsPill extends Extension {
     _currentLayoutShort() {
         try {
             const st = this._layoutSettings;
-            const mru = st.get_value('mru-sources').deep_unpack();
-            if (mru.length)
-                return this._shortSourceId(mru[0][1]);
-            const sources = st.get_value('sources').deep_unpack();
+            // `current` is an index (mru first, sources as fallback) —
+            // NOT always mru[0]: script-driven switches move `current`
+            // without reordering the MRU list.
             const cur = st.get_uint('current');
+            const mru = st.get_value('mru-sources').deep_unpack();
+            if (mru[cur])
+                return this._shortSourceId(mru[cur][1]);
+            const sources = st.get_value('sources').deep_unpack();
             if (sources[cur])
                 return this._shortSourceId(sources[cur][1]);
+            if (mru.length)
+                return this._shortSourceId(mru[0][1]);
         } catch {
             // schema without sources (locked-down session)
         }
@@ -546,6 +551,14 @@ export default class MacospillsCapsPill extends Extension {
         if (!this._caret)
             return;
         this._layoutLabel.set_text(id);
+        // Explicit width from the label's natural size: a min-width-only
+        // pill clips the text to "..." instead of growing.
+        try {
+            const [, natW] = this._layoutLabel.get_preferred_width(-1);
+            this._layoutPill.width = Math.max(PILL_W, natW + 26);
+        } catch {
+            // metrics unavailable: estimate keeps it centered-ish
+        }
         this._layoutShowing = true;
         this._updateWant();
         this._placeLayout();
@@ -574,10 +587,10 @@ export default class MacospillsCapsPill extends Extension {
     }
 
     _placeLayout() {
-        // Width estimate (actor width settles a frame after set_text) —
-        // keeps the flash centered for its whole second, no re-place.
-        const id = this._layoutLabel.get_text() || '';
-        const w = Math.max(PILL_W, id.length * 10 + 26);
+        // Prefer the explicit width set at flash time (estimate only as
+        // fallback) — keeps the flash centered for its whole second.
+        const w = this._layoutPill.width > 0 ? this._layoutPill.width
+            : Math.max(PILL_W, (this._layoutLabel.get_text() || '').length * 10 + 26);
         const c = this._caret;
         const mon = this._monitorFor(c.x + c.w / 2, c.y);
         let x = Math.round(c.x + c.w / 2 - w / 2);
