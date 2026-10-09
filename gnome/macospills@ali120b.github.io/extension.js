@@ -24,6 +24,7 @@
  */
 
 import Clutter from 'gi://Clutter';
+import Gdk from 'gi://Gdk';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Mtk from 'gi://Mtk';
@@ -172,6 +173,23 @@ export default class MacospillsCapsPill extends Extension {
         // snapshots — strict first-key rule.
         this._stageClickId = global.stage.connect(
             'button-press-event', () => this._resetArm());
+        // Delete transient hold (Gecko backspace quirk, same as the
+        // Hyprland bridge): a delete commit can carry a rect jumped the
+        // wrong way. Rects landing inside this window may only move
+        // left/stay on their line; anything else applies instantly.
+        this._deleteUntil = 0;
+        this._stageKeyId = global.stage.connect(
+            'key-press-event', (_a, event) => {
+                try {
+                    const sym = event.get_key_symbol();
+                    if (sym === Gdk.KEY_BackSpace ||
+                        sym === Gdk.KEY_Delete ||
+                        sym === Gdk.KEY_KP_Delete)
+                        this._deleteUntil = Date.now() + 250;
+                } catch {
+                    // unreadable key event: no hold
+                }
+            });
         this._trackFocusedActor();
 
         this._hookPanelService();
@@ -218,6 +236,14 @@ export default class MacospillsCapsPill extends Extension {
                 // stage gone with the session
             }
             this._stageClickId = 0;
+        }
+        if (this._stageKeyId) {
+            try {
+                global.stage.disconnect(this._stageKeyId);
+            } catch {
+                // stage gone with the session
+            }
+            this._stageKeyId = 0;
         }
         this._pill?.destroy();
         this._pill = null;
@@ -455,6 +481,15 @@ export default class MacospillsCapsPill extends Extension {
                 this._hide();
             return;
         }
+        // Delete transient hold: inside a delete window a same-line
+        // rightward jump contradicts the key — hold the old caret for
+        // this update instead of jumping wrong. Next commit confirms.
+        if (this._caret && Date.now() < this._deleteUntil && y === this._caret.y &&
+            x > this._caret.x + 2) {
+            if (DEBUG)
+                log(`macospills: held delete transient ${x},${y}`);
+            return;
+        }
         this._caret = {x, y, w, h};
         if (this._layoutShowing)
             this._placeLayout();
@@ -551,7 +586,14 @@ export default class MacospillsCapsPill extends Extension {
             y = Math.round(c.y - GAP - PILL_H);
         x = Math.max(mon.x, Math.min(mon.x + mon.width - w, x));
         y = Math.max(mon.y, Math.min(mon.y + mon.height - PILL_H, y));
-        this._layoutPill.set_position(x, y);
+        // Ease, don't teleport: per-commit re-place glides the flash
+        // after the caret. Show path removes transitions first, so
+        // appearing still snaps.
+        this._layoutPill.ease({
+            x, y,
+            duration: 60,
+            mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
+        });
     }
 
     // --- placement + fades --------------------------------------------
@@ -579,7 +621,14 @@ export default class MacospillsCapsPill extends Extension {
             y = Math.round(c.y - GAP - PILL_H);
         x = Math.max(mon.x, Math.min(mon.x + mon.width - PILL_W, x));
         y = Math.max(mon.y, Math.min(mon.y + mon.height - PILL_H, y));
-        this._pill.set_position(x, y);
+        // Ease, don't teleport: per-commit re-place glides after the
+        // caret. Show path removes transitions first, so appearing
+        // still snaps.
+        this._pill.ease({
+            x, y,
+            duration: 60,
+            mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
+        });
     }
 
     // Visibility is a state machine, not event soup: every event only
