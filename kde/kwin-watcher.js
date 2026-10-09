@@ -4,6 +4,7 @@
 //
 // Daemon service: org.macospills.kde /pill org.macospills.Pill ActiveWindow
 //   (frameX, frameY, frameW, frameH, clientX, clientY, appId, caption)
+//   + ToggleLayout (Ctrl+Shift+Space flips fcitx5 keyboard-us/ara).
 // clientX/clientY are -1 when the API does not expose client geometry
 // (server-side decorations then need a per-app offset — verified per app).
 
@@ -52,6 +53,18 @@ workspace.windowActivated.connect(function (client) {
     track(w);
     push(w);
 });
+
+// Own Ctrl+Shift+Space (like the GNOME backend): flip fcitx5 us/ara via
+// the daemon. Unregistered automatically when the script unloads.
+try {
+    registerShortcut("Macospills Toggle Layout",
+        "macospills: toggle keyboard layout (us/ara)",
+        "Ctrl+Shift+Space",
+        function () {
+            callDBus('org.macospills.kde', '/pill', 'org.macospills.Pill',
+                'ToggleLayout');
+        });
+} catch (e) {}
 
 track(workspace.activeWindow);
 push(workspace.activeWindow);

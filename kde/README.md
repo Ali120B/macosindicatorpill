@@ -11,7 +11,9 @@ this composes them:
   Qt/Kate reports zero height, so line pitch is measured from
   neighboring rows and cached per document.
 - **Overlay** — `shell.qml` (Quickshell layer-shell, works on KWin),
-  positioned at the caret per `DESIGN.md`, bottom-center fallback.
+  tracks the caret exactly per `DESIGN.md` (direct-set, no glide).
+  Caps: no caret, no pill (no fallback). Layout flash: caret
+  preferred, bottom-center fallback while a textbox is focused.
 
 ## Run
 
@@ -29,8 +31,12 @@ System Settings → Autostart.
   `~/.config/plasma-workspace/env/ats.sh`)
 - GTK apps: `gsettings set org.gnome.desktop.interface toolkit-accessibility true`
 
-Without these (or in apps that stay silent) the pill shows centered
-at the bottom edge, like on Hyprland.
+Without these (or in apps that stay silent) there is no caret to
+track: the layout flash (which needs only a focused textbox) uses the
+bottom-center fallback, and the caps pill hides — except silent
+terminals (foot and friends report a caret to nobody but always hold
+a prompt), where it shows window-anchored while caps is on, unarmed
+(no caret signal exists to arm with).
 
 Notes:
 

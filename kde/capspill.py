@@ -10,7 +10,11 @@ Composes the caret position KWin hides from clients:
   - In-window caret: AT-SPI focused text object, WINDOW-relative extents
     (the only space Wayland toolkits answer truthfully in).
   - Emits /tmp/macospills-kde.json for kde/shell.qml (watched, no IPC
-    spam): {caps: bool, caret: {x,y,w,h} | null} in logical pixels.
+    spam): {caps, hide, hasCaret, hasText, termFb, cx,cy,cw,ch,
+    wx,wy,ww,wh, layout, fseq} in logical pixels. hasText (a textbox is
+    focused) gates the layout flash's bottom-center fallback; termFb
+    (silent terminal, caret unknowable) gates the caps pill's
+    window-anchored fallback. Otherwise caps hides without a caret.
 
 Needs for at-caret mode: QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 (Qt apps)
 and toolkit-accessibility=true (GTK apps). Without them (or where an app
@@ -41,7 +45,15 @@ IFACE = "org.macospills.Pill"
 SCRIPT_NAME = "macospills"
 SCRIPT_PATH = os.path.join(HERE, "kwin-watcher.js")
 POLL_CAPS_MS = 150
-POLL_CARET_MS = 150
+POLL_CARET_MS = 50
+POLL_LAYOUT_MS = 400
+REWALK_IDLE_S = 4.0
+REWALK_EMPTY_S = 2.0
+HASTEXT_TTL_S = 1.0
+# Grace hold: keep reporting the last good rect briefly after a loss so
+# single-poll toolkit flaps (Kate's tree winks mid-typing) don't blink
+# the pill or reset arming. Real focus loss hides ~0.4 s later.
+HOLD_S = 0.4
 MAX_WALK_NODES = 20000
 WALK_BUDGET_S = 0.2
 CACHE_TTL_S = 5.0
@@ -120,6 +132,10 @@ class PillService(dbus.service.Object):
         self.daemon.on_window(int(fx), int(fy), int(fw), int(fh),
                               int(cx), int(cy), str(app_id), str(caption))
 
+    @dbus.service.method(IFACE)
+    def ToggleLayout(self):
+        self.daemon.toggle_layout()
+
 
 class Daemon:
     def __init__(self):
@@ -139,6 +155,20 @@ class Daemon:
         self.stable = None  # last accepted screen caret rect
         self.pending = None  # big jump awaiting confirmation
         self.text_cache = {}  # app_norm -> (timestamp, [accessibles])
+        # Sticky caret node: per-poll fast path (~4 AT-SPI calls) so the
+        # 50 ms loop never re-scores whole trees. Full walks only on app
+        # change, node death, or a static caret past REWALK_IDLE_S (idle
+        # user or a same-app field/tab switch — the rewalk re-resolves).
+        self.best = None  # (app_norm, node, text_iface, app_name)
+        self.best_at = 0
+        self.best_caret = None
+        self.best_static_since = 0
+        self.hastext_at = 0
+        self.hastext_val = False
+        self.dbg_winner = ""
+        self.held_rect = None
+        self.held_win = ""
+        self.hold_until = 0
         self.qs_proc = None
         Atspi.init()
         self.desktop = Atspi.get_desktop(0)
@@ -210,11 +240,17 @@ class Daemon:
             self.win = None
             self.stable = None
             self.pending = None
+            self.best = None
+            self.held_rect = None
+            self.hold_until = 0
             self.emit_state()
             return
         if self.win is None or self.win[6] != app_id:
             self.stable = None
             self.pending = None
+            self.best = None
+            self.held_rect = None
+            self.hold_until = 0
             self.text_cache.pop(norm(app_id), None)
             self.focus_seq += 1
             log(f"active: app={app_id!r} frame=({fx},{fy},{fw},{fh}) "
@@ -225,6 +261,9 @@ class Daemon:
             # tiling move): old caret is stale — require fresh confirm
             self.stable = None
             self.pending = None
+            self.best = None
+            self.held_rect = None
+            self.hold_until = 0
             self.focus_seq += 1
         self.win = (fx, fy, fw, fh, cx, cy, app_id)
 
@@ -238,6 +277,9 @@ class Daemon:
                     # while caps was off — require fresh confirmation
                     self.stable = None
                     self.pending = None
+                    self.best = None
+                    self.held_rect = None
+                    self.hold_until = 0
                 self.emit_state()
         except Exception as e:
             log("caps poll failed:", e)
@@ -290,6 +332,31 @@ class Daemon:
         except Exception as e:
             log("layout poll failed:", e)
         return True
+
+    def read_layout_full(self):
+        if self.layout_src == "fcitx":
+            r = self.qdbus("org.fcitx.Fcitx5", "/controller",
+                           "org.fcitx.Fcitx.Controller1.CurrentInputMethod")
+            if r and r.returncode == 0:
+                return r.stdout.strip()
+        return ""
+
+    def toggle_layout(self):
+        """Ctrl+Shift+Space (KWin global shortcut): flip fcitx5
+        keyboard-us <-> keyboard-ara, mirroring
+        hyprland/layout-toggle.lua. The layout poll picks up the change
+        and flashes the pill."""
+        if self.layout_src != "fcitx":
+            log("toggle: no fcitx source, ignored")
+            return
+        cur = self.read_layout_full()
+        target = "keyboard-ara" if cur == "keyboard-us" else "keyboard-us"
+        try:
+            r = subprocess.run(["fcitx5-remote", "-s", target],
+                               capture_output=True, text=True, timeout=5)
+            log(f"toggle: {cur} -> {target} rc={r.returncode}")
+        except Exception as e:
+            log("toggle failed:", e)
 
     # --- AT-SPI caret -------------------------------------------------
 
@@ -351,13 +418,39 @@ class Daemon:
         self.text_cache[app_norm] = (now, found)
         return found
 
+    def focused_ancestor(self, node, up=5):
+        p = node
+        for _ in range(up):
+            try:
+                p = p.get_parent()
+            except Exception:
+                return False
+            if p is None:
+                return False
+            try:
+                if p.get_state_set().contains(Atspi.StateType.FOCUSED):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    @staticmethod
+    def cand_meta(node, nchars, caret, ncands, how):
+        try:
+            nm = node.get_name() or "?"
+        except Exception:
+            nm = "?"
+        return (f"{how}/{ncands}cands name={nm[:24]!r} "
+                f"nchars={nchars} caret={caret}")
+
     def find_text(self, app_acc, app_norm, allow_empty=False,
                   focused_only=False):
-        """Best caret-bearing text object. Focused-first: FOCUSED+SHOWING
-        nodes win over big background documents (browsers) — the old
-        scorer preferred large nchars and picked the wrong field."""
-        best = None
-        best_score = -1
+        """Best caret-bearing text object. Preference order: directly
+        FOCUSED, then a focused ancestor (Kate tabs: the document never
+        takes FOCUS itself — its view does — so plain scoring can park
+        the pill in the inactive tab), then score. Stashes winner meta
+        in self.dbg_winner for the state log."""
+        cands = []  # (score, focused, node, ti, nchars, caret)
         for node in self.text_nodes(app_acc, app_norm):
             try:
                 states = node.get_state_set()
@@ -383,10 +476,26 @@ class Daemon:
                 score += 500
             if focused:
                 score += 10000
-            if score > best_score:
-                best_score = score
-                best = (node, ti)
-        return best if best else (None, None)
+            cands.append((score, focused, node, ti, nchars, caret))
+        if not cands:
+            self.dbg_winner = "none/0cands"
+            return None, None
+        cands.sort(key=lambda c: -c[0])
+        # A directly-focused node always sorts first (+10000 dominates).
+        if cands[0][1] or focused_only:
+            w = cands[0]
+            self.dbg_winner = self.cand_meta(w[2], w[4], w[5],
+                                             len(cands), "focused")
+            return w[2], w[3]
+        for w in cands[:40]:
+            if self.focused_ancestor(w[2]):
+                self.dbg_winner = self.cand_meta(w[2], w[4], w[5],
+                                                 len(cands), "ancestor")
+                return w[2], w[3]
+        w = cands[0]
+        self.dbg_winner = self.cand_meta(w[2], w[4], w[5],
+                                         len(cands), "score")
+        return w[2], w[3]
 
     def pitch(self, app_name, doc, ti, caret, nchars):
         key = (app_name, doc)
@@ -417,10 +526,67 @@ class Daemon:
         self.pitch_cache[key] = p
         return p
 
-    def caret_rect(self):
-        """(x, y, w, h) in logical screen pixels, or None."""
-        if not self.win:
+    def node_rect(self, node, ti, name, nchars, frame):
+        """Screen caret rect for a known node (stabilized), or None.
+
+        AT-SPI WINDOW extents on this stack are logical pixels (verified:
+        dividing by the output scale pulls every rect toward the screen
+        origin by the scale factor — exactly the observed offset), so no
+        scale division: window origin + extents, rounded."""
+        fx, fy, fw, fh, cx, cy = frame[:6]
+        try:
+            ox = cx if cx >= 0 else fx
+            oy = cy if cy >= 0 else fy
+            if nchars > 0:
+                try:
+                    caret = ti.get_caret_offset()
+                    idx = max(0, min(caret - 1 if caret > 0 else 0, nchars - 1))
+                    e = ti.get_character_extents(idx, Atspi.CoordType.WINDOW)
+                except Exception:
+                    # Flaky toolkit mid-keystroke (Kate serves a stale
+                    # snapshot for a poll): hold the last good rect
+                    # instead of jumping to the field box or hiding.
+                    return self.stable
+                h = e.height if e.height > 0 else self.pitch(
+                    name, self.doc_name(node), ti, caret, nchars)
+                w = e.width if e.width > 0 else 7
+                rect = (ox + e.x, oy + e.y, w, h)
+            else:
+                # Empty field: no characters to measure — use the field's
+                # own box so the pill sits under it instead of fallback.
+                b = node.get_component_iface().get_extents(
+                    Atspi.CoordType.WINDOW)
+                if b.width <= 0 or b.height <= 0:
+                    return None
+                rect = (ox + b.x, oy + b.y, 8,
+                        min(b.height, PITCH_FALLBACK * 2))
+        except Exception:
             return None
+        return self.stabilize(rect, (fx, fy, fw, fh))
+
+    def best_rect(self, node, ti, frame, name):
+        """Fast path: query the sticky node directly (~4 AT-SPI calls).
+        Returns (rect|None, caret|None); None rect means dead/hidden/
+        unreadable — caller rewalks."""
+        try:
+            states = node.get_state_set()
+            if not states.contains(Atspi.StateType.SHOWING):
+                return None, None
+            nchars = ti.get_character_count()
+        except Exception:
+            return None, None
+        caret = None
+        if nchars > 0:
+            try:
+                caret = ti.get_caret_offset()
+            except Exception:
+                pass
+        return self.node_rect(node, ti, name, nchars, frame), caret
+
+    def caret_rect(self):
+        """(rect, node, ti, app_name) — full tree resolve."""
+        if not self.win:
+            return None, None, None, None
         fx, fy, fw, fh, cx, cy, app_id = self.win
         want = norm(app_id)
         self._deadline = time.time() + WALK_BUDGET_S
@@ -435,56 +601,159 @@ class Daemon:
             node, ti = self.find_text(app, want, focused_only=True)
             if ti is None:
                 # some editors (Kate) never mark the document FOCUSED —
-                # fall back to any showing text, then empty fields
+                # focused-ancestor pass inside find_text covers the
+                # active tab; then empty fields
                 node, ti = self.find_text(app, want)
             if ti is None:
                 node, ti = self.find_text(app, want, allow_empty=True)
             if ti is None:
-                return None
+                return None, None, None, None
             try:
                 nchars = ti.get_character_count()
             except Exception:
-                return None
-            ox = cx if cx >= 0 else fx
-            oy = cy if cy >= 0 else fy
-            # Per-monitor scale (window center), not the first output's:
-            # mixed-DPI second-monitor carets were off by the ratio.
-            s = self.scale_at(fx + fw / 2, fy + fh / 2)
-            if nchars > 0:
+                return None, None, None, None
+            return (self.node_rect(node, ti, name, nchars, self.win),
+                    node, ti, name)
+        return None, None, None, None
+
+    # Active terminals are text-focused by construction (prompt input),
+    # even when they expose no AT-SPI tree (foot and other GPU
+    # terminals report a caret to nobody). Match by substring so
+    # wrapped ids (org.kde.konsole, footclient) hit.
+    TERMINALS = ("konsole", "foot", "kitty", "alacritty", "wezterm",
+                 "ghostty", "gnome-terminal", "ptyxis", "tilix",
+                 "terminator", "xterm", "urxvt", "contour", "rio",
+                 "tabby", "warp")
+
+    def focused_text(self):
+        """True when a textbox is selected (see _focused_scan). Fast
+        paths first: silent terminals, then the sticky node; the full
+        tree scan runs at most every HASTEXT_TTL_S."""
+        if not self.win:
+            return False
+        want = norm(self.win[6])
+        # Silent terminals never appear in the AT-SPI tree — check first.
+        if want and any(t in want for t in self.TERMINALS):
+            return True
+        if self.best and self.best[0] == want:
+            try:
+                st = self.best[1].get_state_set()
+                if (st.contains(Atspi.StateType.FOCUSED)
+                        and st.contains(Atspi.StateType.SHOWING)):
+                    return True
+            except Exception:
+                pass
+        now = time.time()
+        if now - self.hastext_at < HASTEXT_TTL_S:
+            return self.hastext_val
+        self.hastext_val = self._focused_scan(want)
+        self.hastext_at = now
+        return self.hastext_val
+
+    def _focused_scan(self, want):
+        """Full scan for a focused, showing text object (or a terminal
+        window's implicit focus); desktop / plain windows stay hidden."""
+        self._deadline = time.time() + WALK_BUDGET_S
+        try:
+            n = self.desktop.get_child_count()
+        except Exception:
+            return False
+        for i in range(n):
+            try:
+                app = self.desktop.get_child_at_index(i)
+                name = norm(app.get_name())
+            except Exception:
+                continue
+            if not want or (want not in name and name not in want):
+                continue
+            for node in self.text_nodes(app, want):
                 try:
-                    caret = ti.get_caret_offset()
+                    states = node.get_state_set()
                 except Exception:
-                    return None
-                idx = max(0, min(caret - 1 if caret > 0 else 0, nchars - 1))
+                    continue
                 try:
-                    e = ti.get_character_extents(idx, Atspi.CoordType.WINDOW)
+                    if (states.contains(Atspi.StateType.FOCUSED)
+                            and states.contains(Atspi.StateType.SHOWING)):
+                        return True
                 except Exception:
-                    return None
-                h = e.height if e.height > 0 else self.pitch(
-                    name, self.doc_name(node), ti, caret, nchars)
-                w = e.width if e.width > 0 else 7
-                rect = (round((ox + e.x) / s), round((oy + e.y) / s),
-                        round(w / s), round(h / s))
-            else:
-                # Empty field: no characters to measure — use the field's
-                # own box so the pill sits under it instead of fallback.
-                try:
-                    b = node.get_component_iface().get_extents(
-                        Atspi.CoordType.WINDOW)
-                except Exception:
-                    return None
-                if b.width <= 0 or b.height <= 0:
-                    return None
-                rect = (round((ox + b.x) / s), round((oy + b.y) / s),
-                        round(8 / s),
-                        round(min(b.height, PITCH_FALLBACK * 2) / s))
-            return self.stabilize(rect, (fx, fy, fw, fh))
+                    continue
+            return False
+        return False
+
+    def caret_info(self):
+        """(rect | None, has_text: bool). Sticky-node fast path keeps
+        polls O(1) (~4 AT-SPI calls); full walks only on app change,
+        node death, or a caret static past REWALK_IDLE_S (idle user or
+        a same-app field/tab switch — the rewalk re-resolves). Brief
+        losses hold the last good rect for HOLD_S (flap cover)."""
+        if not self.win:
+            self.best = None
+            return None, False
+        want = norm(self.win[6])
+        now = time.time()
+        rect = self.fast_rect(want, now)
+        if rect is None:
+            rect = self.resolve_rect(want, now)
+        if rect is not None:
+            self.held_rect = rect
+            self.held_win = want
+            self.hold_until = now + HOLD_S
+            return rect, True
+        if (self.held_rect is not None and now < self.hold_until
+                and want and want == self.held_win):
+            return self.held_rect, True
+        return None, self.focused_text()
+
+    def fast_rect(self, want, now):
+        """Sticky-node fast path, or None (rewalk needed)."""
+        if self.best and self.best[0] == want:
+            _, node, ti, name = self.best
+            rect, caret = self.best_rect(node, ti, self.win, name)
+            if rect is not None:
+                if caret is None:
+                    # Empty field: no liveness signal — re-resolve on TTL
+                    # (freshly typed text may live in a new node) so the
+                    # pill never parks on a stale empty snapshot.
+                    if now - self.best_static_since > REWALK_EMPTY_S:
+                        self.best_static_since = now
+                    else:
+                        return rect
+                elif self.fresh_caret(caret, now):
+                    return rect
+                # else: static too long (idle or a same-app field/tab
+                # switch) — fall through to rewalk
+            # else: node died/hidden — fall through to rewalk
         return None
 
+    def resolve_rect(self, want, now):
+        """Full tree walk; re-stickies the winner."""
+        rect, node, ti, name = self.caret_rect()
+        if node is not None:
+            self.best = (want, node, ti, name)
+            self.best_at = now
+            try:
+                self.best_caret = ti.get_caret_offset()
+            except Exception:
+                self.best_caret = None
+            self.best_static_since = now
+        else:
+            self.best = None
+        return rect
+
+    def fresh_caret(self, caret, now):
+        """True when the sticky node is still the live field: a moving
+        caret, or static for less than REWALK_IDLE_S."""
+        if caret != self.best_caret:
+            self.best_caret = caret
+            self.best_static_since = now
+            return True
+        return now - self.best_static_since < REWALK_IDLE_S
+
     def stabilize(self, rect, frame):
-        """Reject garbage rects: must sit inside the window, and big jumps
-        need a confirming second poll (kills the fly-around on focus
-        changes while keeping typing moves instant)."""
+        """Reject garbage rects: must sit inside the window, and moves
+        past typing scale need a confirming second poll (kills the
+        fly-around on focus changes and flaky mid-keystroke snapshots
+        while keeping typing moves instant)."""
         fx, fy, fw, fh = frame
         m = 64
         inside = (rect[0] + rect[2] / 2 >= fx - m and
@@ -499,7 +768,7 @@ class Daemon:
             self.pending = None
             return rect
         move = abs(rect[0] - self.stable[0]) + abs(rect[1] - self.stable[1])
-        if move < 400:
+        if move < 60:
             self.stable = rect
             self.pending = None
             return rect
@@ -536,25 +805,43 @@ class Daemon:
         return True
 
     def emit_state(self):
-        caret = self.caret_rect() if self.caps else None
-        # No caret, no pill: when Caps is on but no textbox is focused,
-        # hide instead of falling back (explicit user call).
-        hide = caret is None
-        if caret:
-            state = {"caps": True, "hide": False, "hasCaret": True,
-                     "cx": caret[0], "cy": caret[1],
-                     "cw": caret[2], "ch": caret[3],
+        rect, has_text = self.caret_info()
+        # Caps: no caret, no pill — except silent terminals (always a
+        # textbox, caret unknowable): window-anchored fallback, unarmed.
+        # Layout flash (shell-side): caret preferred, bottom-center
+        # fallback while a textbox is focused, hidden otherwise.
+        if self.win:
+            fx, fy, fw, fh = self.win[0], self.win[1], self.win[2], self.win[3]
+            want = norm(self.win[6])
+        else:
+            fx = fy = fw = fh = 0
+            want = ""
+        term_fb = (rect is None and has_text and want and
+                   any(t in want for t in self.TERMINALS))
+        if rect:
+            state = {"caps": bool(self.caps), "hide": False,
+                     "hasCaret": True, "hasText": True, "termFb": False,
+                     "cx": rect[0], "cy": rect[1],
+                     "cw": rect[2], "ch": rect[3],
+                     "wx": fx, "wy": fy, "ww": fw, "wh": fh,
                      "layout": self.layout or "",
                      "fseq": self.focus_seq}
         else:
-            state = {"caps": bool(self.caps), "hide": hide,
-                     "hasCaret": False,
+            state = {"caps": bool(self.caps), "hide": True,
+                     "hasCaret": False, "hasText": bool(has_text),
+                     "termFb": bool(term_fb),
                      "cx": 0, "cy": 0, "cw": 0, "ch": 0,
+                     "wx": fx, "wy": fy, "ww": fw, "wh": fh,
                      "layout": self.layout or "",
                      "fseq": self.focus_seq}
         js = json.dumps(state)
         if js != self.last_json:
             self.last_json = js
+            log(f"state caps={state['caps']} caret={state['hasCaret']} "
+                f"text={state['hasText']} "
+                f"rect=({state['cx']},{state['cy']},{state['cw']},{state['ch']}) "
+                f"layout={state['layout']} fseq={state['fseq']} "
+                f"{self.dbg_winner}")
             try:
                 with open(STATE_PATH, "w") as f:
                     f.write(js)
@@ -573,7 +860,7 @@ class Daemon:
         self.emit_state()
         GLib.timeout_add(POLL_CAPS_MS, self.poll_caps)
         GLib.timeout_add(POLL_CARET_MS, self.poll_caret)
-        GLib.timeout_add(1000, self.poll_layout)
+        GLib.timeout_add(POLL_LAYOUT_MS, self.poll_layout)
         try:
             GLib.MainLoop().run()
         except KeyboardInterrupt:

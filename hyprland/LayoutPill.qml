@@ -2,8 +2,10 @@ import QtQuick
 
 // macOS-style input-source flash: same blue capsule as CapsPill, but a
 // tracked-out source code ("EN", "AR") instead of the ⇪ glyph.
-// Auto-width: 46px minimum, grows with the label. Shown 1 s on layout
-// switch, at the caret, only where a caret is known.
+// Natural width hugging the text: the capsule binds the label's
+// implicitWidth (content size, always current) with slim ~8px side
+// padding and a 46px floor — never hand-measured (paintedWidth goes
+// stale on a hidden actor and clips to "..."). Ellipsis off.
 Item {
     id: pill
 
@@ -13,11 +15,11 @@ Item {
     readonly property int capsuleHeight: 30
     readonly property int capsuleMinWidth: 46
     readonly property int margin: 14
-    readonly property int hPad: 13
+    readonly property int hPad: 8
     readonly property color capsuleColor: "#0a84ff"
     readonly property color inkColor: "#ffffff"
 
-    implicitWidth: Math.max(capsuleMinWidth, label.paintedWidth + 2 * pill.hPad) + 2 * pill.margin
+    implicitWidth: Math.max(capsuleMinWidth, label.implicitWidth + 2 * pill.hPad) + 2 * pill.margin
     implicitHeight: pill.capsuleHeight + 2 * pill.margin
 
     opacity: 0
@@ -70,7 +72,7 @@ Item {
     Rectangle {
         id: capsule
         anchors.centerIn: parent
-        width: Math.max(pill.capsuleMinWidth, label.paintedWidth + 2 * pill.hPad)
+        width: Math.max(pill.capsuleMinWidth, label.implicitWidth + 2 * pill.hPad)
         height: pill.capsuleHeight
         radius: height / 2
         color: pill.capsuleColor
@@ -84,6 +86,8 @@ Item {
             font.pixelSize: 13
             font.weight: Font.DemiBold
             font.letterSpacing: 2
+            wrapMode: Text.NoWrap
+            elide: Text.ElideNone
         }
     }
 }
