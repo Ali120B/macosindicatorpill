@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist gettext-domain="macospills">
+  <schema id="org.gnome.shell.extensions.macospills"
+          path="/org/gnome/shell/extensions/macospills/">
+    <key name="toggle-layout" type="as">
+      <default><![CDATA[['<Primary><Shift>space']]]></default>
+      <summary>Toggle input source</summary>
+      <description>
+        Accelerator that cycles the keyboard input source via the
+        shell's own InputSourceManager (the only path that really
+        switches). The pill flashes whenever a textbox is focused.
+      </description>
+    </key>
+  </schema>
+</schemalist>

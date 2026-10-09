@@ -9,6 +9,9 @@ __pycache__/
 *.log
 *.qslog
 
+# compiled gsettings schemas (regenerate with glib-compile-schemas)
+gschemas.compiled
+
 # editor / OS
 .vscode/
 .idea/

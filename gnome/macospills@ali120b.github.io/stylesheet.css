@@ -11,21 +11,22 @@
     icon-size: 16px;
 }
 
-/* Layout flash — same capsule, tracked source label. */
+/* Layout flash — same capsule, tracked source label. Slim side
+ * padding so 2-3 char ids hug the text (~caps width); min-width
+ * floors the smallest ids to exactly the caps size. */
 .macospills-layout-pill {
     background-color: #0a84ff;
     border-radius: 15px;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
     min-width: 46px;
     height: 30px;
-    padding-left: 13px;
-    padding-right: 13px;
+    padding-left: 8px;
+    padding-right: 8px;
 }
 
 .macospills-layout-label {
     font-family: 'Inter', sans-serif;
     font-size: 13px;
     font-weight: 600;
-    letter-spacing: 2px;
     color: #ffffff;
 }

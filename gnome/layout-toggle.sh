@@ -1,22 +1,38 @@
 #!/usr/bin/env bash
-# Cycle GNOME input sources (e.g. English <-> Arabic) for binding to
-# Ctrl+Shift+Space. Changing `current` fires the extension's layout
-# flash (1 s at the caret), so no extra wiring is needed.
+# macospills GNOME layout toggle — RETIRED as a switcher.
 #
-# Setup:
-#   1. Have ≥2 sources (Settings → Keyboard → Input Sources).
-#   2. Point the command below at this file's real path, then run:
-#        gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings \
-#          "['/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/']"
-#        gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/ name 'Toggle input source'
-#        gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/ command '/path/to/layout-toggle.sh'
-#        gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/ binding '<Primary><Shift>space'
-set -euo pipefail
-
-cur=$(gsettings get org.gnome.desktop.input-sources current | awk '{print $2}')
-n=$(gsettings get org.gnome.desktop.input-sources mru-sources | grep -o "('" | wc -l)
-if [ "${n:-0}" -lt 2 ]; then
-  echo "layout-toggle: need 2+ input sources" >&2
-  exit 1
+# Why retired: this script used to write
+#   org.gnome.desktop.input-sources current
+# but that key is DEPRECATED and ignored by the shell (see
+# /usr/share/glib-2.0/schemas/org.gnome.desktop.input-sources.gschema.xml),
+# so it never actually switched layouts. And `mru-sources` is written BY
+# the shell after a switch, not read to trigger one — writing it doesn't
+# switch either. The only reliable switch path is the shell's own
+# InputSourceManager (Mutter xkb + IBus engine together), which the
+# extension now calls in-process on Ctrl+Shift+Space. No script needed.
+#
+# What to do:
+#   1. REMOVE the old media-keys custom binding for Ctrl+Shift+Space
+#      (it would double-fire with the extension). This script does that
+#      for you when run once — or run the gsettings commands below.
+#   2. Keep the extension enabled. Ctrl+Shift+Space just works, and the
+#      pill flashes on real switches (Super+Space, top-bar menu, and
+#      Ctrl+Shift+Space alike) whenever a textbox is focused.
+#
+# Migration (removes a custom0 binding named 'Toggle input source'):
+set -u
+CUSTOM=/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/
+name=$(gsettings get org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${CUSTOM} name 2>/dev/null || true)
+if echo "$name" | grep -qi "toggle input source"; then
+    gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "@as []"
+    gsettings reset org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${CUSTOM} name 2>/dev/null || true
+    gsettings reset org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${CUSTOM} command 2>/dev/null || true
+    gsettings reset org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${CUSTOM} binding 2>/dev/null || true
+    echo "macospills: removed legacy media-keys custom0 'Toggle input source'."
+    echo "macospills: Ctrl+Shift+Space is now owned by the extension — nothing else to set up."
+else
+    echo "macospills: no legacy 'Toggle input source' binding found at custom0."
+    echo "macospills: if Ctrl+Shift+Space does nothing, make sure the extension is enabled;"
+    echo "macospills: if it double-switches, delete your media-keys custom binding for it:"
+    echo "  gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings \"@as []\""
 fi
-gsettings set org.gnome.desktop.input-sources current "$(( (cur + 1) % n ))"

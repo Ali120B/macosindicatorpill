@@ -55,8 +55,14 @@ with the label.
 - Shows for **1 s** on real layout switches, placed exactly like the
   caps pill (below the caret, 6 px capsule gap; above without room).
   Snaps on appear, follows the caret while showing.
-- Same visibility rules: a known caret is required — never the
-  fallback, never on the desktop. Re-switching restarts the hold.
+- Visibility: a **focused text field** is required — never the
+  desktop, never a plain window. A known caret is preferred, but focus
+  alone suffices (no keypress needed — the switch hotkey is the
+  interaction): pre-first-keystroke the flash uses the monitor fallback
+  instead of being dropped. This matches Hyprland, whose bridge already
+  has a caret the moment a field gains focus, while GNOME/IBus clients
+  typically send their first rect only on the first keystroke.
+  Re-switching restarts the hold.
   Needs no key-arming (the switch hotkey is the interaction).
 - Precedence: a switch always preempts a showing caps pill for its
   second, then hands back to it. Caps turning on preempts a flash but
