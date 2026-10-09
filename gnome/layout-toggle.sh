@@ -13,7 +13,7 @@
 #        gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/ binding '<Primary><Shift>space'
 set -euo pipefail
 
-cur=$(gsettings get org.gnome.desktop.input-sources current | tr -dc '0-9')
+cur=$(gsettings get org.gnome.desktop.input-sources current | awk '{print $2}')
 n=$(gsettings get org.gnome.desktop.input-sources mru-sources | grep -o "('" | wc -l)
 if [ "${n:-0}" -lt 2 ]; then
   echo "layout-toggle: need 2+ input sources" >&2
