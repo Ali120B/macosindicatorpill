@@ -37,6 +37,28 @@ overlay mechanism and caret source differ per compositor.
 ## Behavior
 
 - **Held while Caps Lock is ON**, hidden when it goes off.
-- Re-shown when focus changes with caps still on (macOS `caps_on_focus`).
+- **First-key arming**: appears only after live typing in the focused
+  field — never on the caps toggle, a focus jump, or a mouse click.
+  Arming latches till caps off / focus or click change / caret loss, so
+  every field needs a fresh keypress, no exceptions.
+  (Supersedes the old caps_on_focus re-pop: focus changes with caps on
+  stay hidden until you type.)
 - Caps-only. No layout/num pills.
 - Caps state from the **kernel LED** (`/sys/class/leds/*capslock/brightness`).
+
+## Layout flash
+
+macOS flashes the input source ~1 s on switch. Same capsule, short
+source label (`EN`, `ARA`) instead of ⇪; 46 px minimum width, grows
+with the label.
+
+- Shows for **1 s** on real layout switches, placed exactly like the
+  caps pill (below the caret, 6 px capsule gap; above without room).
+  Snaps on appear, follows the caret while showing.
+- Same visibility rules: a known caret is required — never the
+  fallback, never on the desktop. Re-switching restarts the hold.
+  Needs no key-arming (the switch hotkey is the interaction).
+- Precedence: a switch always preempts a showing caps pill for its
+  second, then hands back to it. Caps turning on preempts a flash but
+  stays hidden itself until a keypress (strict arming, no exceptions).
+- The first value seen after start is the seed, never a flash.

@@ -128,6 +128,11 @@ class Daemon:
         self.scale = output_scale()
         self.outputs = output_layout()
         self.outputs_at = time.time()
+        self.layout = ""
+        self.layout_src = None
+        # Focus generation: bumped on every real window change so the
+        # overlay can re-arm the first-key gate per field.
+        self.focus_seq = 0
         self.caps = None
         self.win = None  # (fx,fy,fw,fh,cx,cy,app_id)
         self.last_json = ""
@@ -212,6 +217,7 @@ class Daemon:
             self.stable = None
             self.pending = None
             self.text_cache.pop(norm(app_id), None)
+            self.focus_seq += 1
             log(f"active: app={app_id!r} frame=({fx},{fy},{fw},{fh}) "
                 f"client=({cx},{cy}) caption={caption[:40]!r}")
         elif (self.win[0], self.win[1], self.win[2], self.win[3]) != \
@@ -220,6 +226,7 @@ class Daemon:
             # tiling move): old caret is stale — require fresh confirm
             self.stable = None
             self.pending = None
+            self.focus_seq += 1
         self.win = (fx, fy, fw, fh, cx, cy, app_id)
 
     def poll_caps(self):
@@ -235,6 +242,54 @@ class Daemon:
                 self.emit_state()
         except Exception as e:
             log("caps poll failed:", e)
+        return True
+
+    # --- layout pill ---------------------------------------------------
+    # macOS flashes the input source ~1 s on switch. Sources, best first:
+    # fcitx5 (CurrentInputMethod — run.sh starts it anyway) covers
+    # fcitx-managed switching; native Plasma XKB groups are probed via
+    # org.kde.keyboard and logged (report the log line if the pill never
+    # fires — the service path varies). No source -> pill stays off.
+
+    @staticmethod
+    def short_im(name):
+        """'keyboard-us' -> 'US', 'keyboard-ara' -> 'ARA'."""
+        short = (name or "").split("-")[-1].upper()
+        return short[:6] if short else ""
+
+    def discover_layout(self):
+        r = self.qdbus("org.fcitx.Fcitx5", "/controller",
+                       "org.fcitx.Fcitx.Controller1.CurrentInputMethod")
+        if r and r.returncode == 0 and r.stdout.strip():
+            self.layout_src = "fcitx"
+            self.layout = self.short_im(r.stdout.strip())
+            log(f"layout source: fcitx5 ({self.layout})")
+            return
+        r = self.qdbus("org.kde.keyboard", "/Layouts")
+        if r and r.returncode == 0:
+            log("org.kde.keyboard /Layouts methods:",
+                r.stdout.strip().split("\n")[:8])
+        else:
+            log("org.kde.keyboard: no /Layouts (native probe off)")
+        self.layout_src = None
+        log("layout source: none (layout pill off)")
+
+    def read_layout(self):
+        if self.layout_src == "fcitx":
+            r = self.qdbus("org.fcitx.Fcitx5", "/controller",
+                           "org.fcitx.Fcitx.Controller1.CurrentInputMethod")
+            if r and r.returncode == 0:
+                return self.short_im(r.stdout.strip())
+        return self.layout
+
+    def poll_layout(self):
+        try:
+            cur = self.read_layout()
+            if cur != self.layout:
+                self.layout = cur
+                self.emit_state()
+        except Exception as e:
+            log("layout poll failed:", e)
         return True
 
     # --- AT-SPI caret -------------------------------------------------
@@ -489,11 +544,15 @@ class Daemon:
         if caret:
             state = {"caps": True, "hide": False, "hasCaret": True,
                      "cx": caret[0], "cy": caret[1],
-                     "cw": caret[2], "ch": caret[3]}
+                     "cw": caret[2], "ch": caret[3],
+                     "layout": self.layout or "",
+                     "fseq": self.focus_seq}
         else:
             state = {"caps": bool(self.caps), "hide": hide,
                      "hasCaret": False,
-                     "cx": 0, "cy": 0, "cw": 0, "ch": 0}
+                     "cx": 0, "cy": 0, "cw": 0, "ch": 0,
+                     "layout": self.layout or "",
+                     "fseq": self.focus_seq}
         js = json.dumps(state)
         if js != self.last_json:
             self.last_json = js
@@ -509,11 +568,13 @@ class Daemon:
         dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
         PillService(self)
         self.load_watcher()
+        self.discover_layout()
         self.start_overlay()
         self.caps = any(read_brightness(p) for p in self.leds)
         self.emit_state()
         GLib.timeout_add(POLL_CAPS_MS, self.poll_caps)
         GLib.timeout_add(POLL_CARET_MS, self.poll_caret)
+        GLib.timeout_add(1000, self.poll_layout)
         try:
             GLib.MainLoop().run()
         except KeyboardInterrupt:

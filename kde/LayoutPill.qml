@@ -1,0 +1,1 @@
+../hyprland/LayoutPill.qml

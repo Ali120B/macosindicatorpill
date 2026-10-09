@@ -39,15 +39,20 @@ const GAP = 6;
 const FADE_IN_MS = 90;
 const FADE_OUT_MS = 140;
 const POLL_MS = 150;
+const LAYOUT_HOLD_MS = 1000;
 const DEBUG = false;
 
 export default class MacospillsCapsPill extends Extension {
     enable() {
         this._capsOn = false;
-        this._capsOnAt = 0;
         this._wanted = false;
         this._fadeToken = 0;
         this._caret = null; // {x, y, w, h} in stage coords, or null
+        // First-key arming (same rule as Hyprland/KDE): the pill appears
+        // only after live typing in the focused field. Focus generation
+        // re-arms per field; arrivals (null base) only snapshot.
+        this._armed = false;
+        this._armBase = null;
         this._suppressUntil = 0; // ignore transitional carets after focus jumps
         this._actorSignals = [];
         this._trackedActor = null;
@@ -72,6 +77,38 @@ export default class MacospillsCapsPill extends Extension {
         });
         this._pill.set_child(icon);
         Main.uiGroup.add_child(this._pill);
+
+        // Layout flash (macOS input-source pill): same capsule, short
+        // source label ("US", "ARA"). 1 s at the caret on real switches,
+        // caret required, held caps pill wins conflicts.
+        this._layoutLabel = new St.Label({
+            style_class: 'macospills-layout-label',
+        });
+        this._layoutPill = new St.Bin({
+            style_class: 'macospills-layout-pill',
+            x_align: Clutter.ActorAlign.CENTER,
+            y_align: Clutter.ActorAlign.CENTER,
+            opacity: 0,
+            visible: false,
+            reactive: false,
+        });
+        this._layoutPill.set_child(this._layoutLabel);
+        Main.uiGroup.add_child(this._layoutPill);
+        this._lastLayout = '';
+        this._seenLayout = false;
+        this._layoutTimerId = 0;
+        this._layoutShowing = false;
+        try {
+            this._layoutSettings = new Gio.Settings({
+                schema_id: 'org.gnome.desktop.input-sources',
+            });
+            this._layoutChangedId = this._layoutSettings.connect(
+                'changed::current', () => this._onLayoutSwitch());
+            this._lastLayout = this._currentLayoutShort();
+            this._seenLayout = true;
+        } catch {
+            this._layoutSettings = null;
+        }
 
         const manager = getIBusManager();
         this._busSignals.push(
@@ -103,12 +140,16 @@ export default class MacospillsCapsPill extends Extension {
                 // the first keystroke) — drop it and wait for the real
                 // one instead of sitting at the last spot.
                 this._caret = null;
+                this._resetArm();
+                this._cancelLayoutFlash();
                 if (this._capsOn)
                     this._hide();
             }));
         this._busSignals.push(
             manager.connect('focus-out', () => {
                 this._caret = null;
+                this._resetArm();
+                this._cancelLayoutFlash();
                 this._hide();
             }));
         this._focusWindowId = global.display.connect(
@@ -120,10 +161,17 @@ export default class MacospillsCapsPill extends Extension {
                 // (usually the first keystroke) instead of sitting at
                 // a weird spot.
                 this._caret = null;
+                this._resetArm();
+                this._cancelLayoutFlash();
                 this._suppressUntil = Date.now() + 400;
                 this._trackFocusedActor();
                 this._updateWant();
             });
+        // Clicks move the caret with no keypress (same-surface fields
+        // send no focus event): turn the arming generation so the
+        // arrival only snapshots — strict first-key rule.
+        this._stageClickId = global.stage.connect(
+            'button-press-event', () => this._resetArm());
         this._trackFocusedActor();
 
         this._hookPanelService();
@@ -141,6 +189,18 @@ export default class MacospillsCapsPill extends Extension {
             GLib.source_remove(this._pollId);
             this._pollId = 0;
         }
+        if (this._layoutTimerId) {
+            GLib.source_remove(this._layoutTimerId);
+            this._layoutTimerId = 0;
+        }
+        if (this._layoutSettings && this._layoutChangedId) {
+            try {
+                this._layoutSettings.disconnect(this._layoutChangedId);
+            } catch {
+                // settings gone with the session
+            }
+        }
+        this._layoutSettings = null;
         const manager = getIBusManager();
         for (const id of this._busSignals)
             manager.disconnect(id);
@@ -151,8 +211,19 @@ export default class MacospillsCapsPill extends Extension {
             global.display.disconnect(this._focusWindowId);
             this._focusWindowId = 0;
         }
+        if (this._stageClickId) {
+            try {
+                global.stage.disconnect(this._stageClickId);
+            } catch {
+                // stage gone with the session
+            }
+            this._stageClickId = 0;
+        }
         this._pill?.destroy();
         this._pill = null;
+        this._layoutPill?.destroy();
+        this._layoutPill = null;
+        this._layoutLabel = null;
         this._caret = null;
     }
 
@@ -199,11 +270,28 @@ export default class MacospillsCapsPill extends Extension {
             return;
         this._capsOn = on;
         if (on) {
-            this._capsOnAt = Date.now();
+            // Preempt any layout flash. Strict first-key rule: the
+            // toggle arms nothing — first keypress arms.
+            this._cancelLayoutFlash();
+            this._resetArm();
             this._show();
         } else {
             this._hide();
         }
+    }
+
+    _resetArm() {
+        this._armed = false;
+        this._armBase = null;
+    }
+
+    _cancelLayoutFlash() {
+        if (this._layoutTimerId) {
+            GLib.source_remove(this._layoutTimerId);
+            this._layoutTimerId = 0;
+        }
+        this._layoutShowing = false;
+        this._layoutPill?.hide();
     }
 
     // --- caret tracking (mirrors 51.0 ibusCandidatePopup.js) -----------
@@ -333,6 +421,7 @@ export default class MacospillsCapsPill extends Extension {
             // Degenerate rect (field blurred/emptied): no caret to
             // point at — hide instead of parking top-left.
             this._caret = null;
+            this._resetArm();
             if (this._capsOn)
                 this._hide();
             return;
@@ -367,8 +456,102 @@ export default class MacospillsCapsPill extends Extension {
             return;
         }
         this._caret = {x, y, w, h};
-        if (this._capsOn)
+        if (this._layoutShowing)
+            this._placeLayout();
+        if (this._capsOn) {
+            // First-key arming: a rect->rect move with a caret up arms;
+            // arrivals (null base) only snapshot. Same-focus typing
+            // always arms; focus jumps re-baselined above never do.
+            if (!this._armBase) {
+                this._armBase = this._caret;
+            } else if (x !== this._armBase.x || y !== this._armBase.y ||
+                       w !== this._armBase.w || h !== this._armBase.h) {
+                this._armed = true;
+                this._armBase = this._caret;
+            }
             this._show();
+        }
+    }
+
+    // --- layout flash -------------------------------------------------
+
+    _shortSourceId(type, id) {
+        const base = String(id).split('+')[0].toUpperCase();
+        return base.slice(0, 6) || '?';
+    }
+
+    _currentLayoutShort() {
+        try {
+            const st = this._layoutSettings;
+            const mru = st.get_value('mru-sources').deep_unpack();
+            if (mru.length)
+                return this._shortSourceId(mru[0][0], mru[0][1]);
+            const sources = st.get_value('sources').deep_unpack();
+            const cur = st.get_uint('current');
+            if (sources[cur])
+                return this._shortSourceId(sources[cur][0], sources[cur][1]);
+        } catch {
+            // schema without sources (locked-down session)
+        }
+        return '';
+    }
+
+    _onLayoutSwitch() {
+        const id = this._currentLayoutShort();
+        if (!this._seenLayout) {
+            this._seenLayout = true;
+            this._lastLayout = id;
+            return;
+        }
+        if (!id || id === this._lastLayout)
+            return;
+        this._lastLayout = id;
+        // Same rules as the caps pill (caret required). Preempts a
+        // showing caps pill; the timer hands back to it.
+        if (!this._caret)
+            return;
+        this._layoutLabel.set_text(id);
+        this._layoutShowing = true;
+        this._updateWant();
+        this._placeLayout();
+        this._layoutPill.visible = true;
+        this._layoutPill.remove_all_transitions();
+        this._layoutPill.ease({
+            opacity: 255,
+            duration: FADE_IN_MS,
+            mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
+        });
+        if (this._layoutTimerId)
+            GLib.source_remove(this._layoutTimerId);
+        this._layoutTimerId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT, LAYOUT_HOLD_MS, () => {
+                this._layoutTimerId = 0;
+                this._layoutShowing = false;
+                this._layoutPill.ease({
+                    opacity: 0,
+                    duration: FADE_OUT_MS,
+                    mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
+                    onComplete: () => this._layoutPill?.hide(),
+                });
+                this._updateWant();
+                return GLib.SOURCE_REMOVE;
+            });
+    }
+
+    _placeLayout() {
+        // Width estimate (actor width settles a frame after set_text) —
+        // keeps the flash centered for its whole second, no re-place.
+        const id = this._layoutLabel.get_text() || '';
+        const w = Math.max(PILL_W, id.length * 10 + 26);
+        const c = this._caret;
+        const mon = this._monitorFor(c.x + c.w / 2, c.y);
+        let x = Math.round(c.x + c.w / 2 - w / 2);
+        let y = Math.round(c.y + c.h + GAP);
+        if (y + PILL_H > mon.y + mon.height)
+            y = Math.round(c.y - GAP - PILL_H);
+        x = Math.max(mon.x, Math.min(mon.x + mon.width - w, x));
+        y = Math.max(mon.y, Math.min(mon.y + mon.height - PILL_H, y));
+        this._layoutPill.set_position(x, y);
     }
 
     // --- placement + fades --------------------------------------------
@@ -406,19 +589,13 @@ export default class MacospillsCapsPill extends Extension {
     // Visibility is a state machine, not event soup: every event only
     // updates state and calls _updateWant(), and the 150 ms poll
     // reconciles, so no missed event can wedge the pill on or off.
+    // First-key rule: wanted needs a known caret AND live typing
+    // (_armed). No caret fallback — a pill with nowhere to point is
+    // worse than none. A flashing layout pill suppresses caps for its
+    // second (hands back on expiry).
     _updateWant() {
-        // Grace fallback (bottom-center right after caps goes on) only
-        // when a window is focused. On the bare desktop / overview
-        // (no focus window, no key focus) there is no caret to point
-        // at — hide instead of idling bottom-center.
-        const hasFocus = !!(global.display.focus_window ||
-            global.stage.key_focus);
-        if (this._capsOn && !this._caret && !hasFocus) {
-            this._setWanted(false);
-            return;
-        }
-        const grace = Date.now() - this._capsOnAt <= 1500;
-        this._setWanted(this._capsOn && (!!this._caret || grace));
+        this._setWanted(this._capsOn && this._armed && !!this._caret &&
+            !this._layoutShowing);
     }
 
     _setWanted(want) {

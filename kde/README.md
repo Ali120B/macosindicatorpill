@@ -34,9 +34,9 @@ at the bottom edge, like on Hyprland.
 
 Notes:
 
-- Switching windows fades the pill out; it reappears once the new
-  caret confirms (or the fallback shows after ~0.6 s). It never gets
-  stuck at the old spot.
+- Switching windows hides the pill; it reappears after the first
+  keypress in the new field (first-key arming). It never gets stuck at
+  the old spot.
 - Big trees (browsers) are cached, so the first focus in a heavy app
   can take a moment; typing then follows smoothly.
 - foot (and other GPU terminals without accessibility support) cannot
@@ -46,7 +46,8 @@ Notes:
 ## Files
 
 - `capspill.py` — daemon: LED poll, AT-SPI caret, D-Bus service,
-  KWin script lifecycle, overlay lifecycle
+  KWin script lifecycle, overlay lifecycle, layout source
 - `kwin-watcher.js` — KWin script (active-window geometry push)
 - `shell.qml` — overlay (placement + fades, reads state file)
 - `CapsPill.qml` — symlink to the shared capsule
+- `LayoutPill.qml` — symlink to the shared layout flash (1 s)

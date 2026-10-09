@@ -10,3 +10,22 @@
 .macospills-caps-icon {
     icon-size: 16px;
 }
+
+/* Layout flash — same capsule, flag + tracked source label. */
+.macospills-layout-pill {
+    background-color: #0a84ff;
+    border-radius: 15px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+    min-width: 46px;
+    height: 30px;
+    padding-left: 13px;
+    padding-right: 13px;
+}
+
+.macospills-layout-label {
+    font-family: 'Inter', sans-serif;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 2px;
+    color: #ffffff;
+}

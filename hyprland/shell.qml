@@ -51,22 +51,112 @@ ShellRoot {
     property int cw: bridge.w
     property int ch: bridge.h
     property int caretWin: bridge.win
-    property bool atCaret: root.capsOn && root.hasCaret
+    property int caretAge: bridge.age
+    property string layout: bridge.layout
+    property string lastLayout: ""
+    property bool seenLayout: false
+    property int lpx: 0
+    property int lpy: 0
+    property bool atCaret: root.capsOn && root.armed && root.hasCaret
+    // First-key arming: the pill appears only after live typing in the
+    // focused field — never on the caps toggle or a focus jump alone.
+    // Latches till caps off / focus change / caret loss (each needs a
+    // fresh keypress). Order-safe: baseline resets also disarm, so a
+    // focus arrival can never arm, and typing always can.
+    property bool armed: false
+    property bool armLive: false
+    property int armCx: 0
+    property int armCy: 0
+    property int armCw: 0
+    property int armCh: 0
 
     onCapsOnChanged: root.applyState()
-    onHasCaretChanged: root.applyState()
-    onCaretWinChanged: if (root.capsOn && root.capsOnFocus) pill.poke()
-    onCxChanged: if (root.atCaret) root.updatePosition()
-    onCyChanged: if (root.atCaret) root.updatePosition()
-    onCwChanged: if (root.atCaret) root.updatePosition()
-    onChChanged: if (root.atCaret) root.updatePosition()
+    onAtCaretChanged: root.applyState()
+    onHasCaretChanged: {
+        if (!root.hasCaret) {
+            root.resetArm();
+            layoutTimer.stop();
+            layoutPill.hide();
+        }
+    }
+    onCaretWinChanged: {
+        root.resetArm();
+        layoutTimer.stop();
+        layoutPill.hide();
+        if (root.capsOn && root.capsOnFocus)
+            pill.poke();
+    }
+    onLayoutChanged: root.onLayoutSwitch()
+    onCxChanged: {
+        if (root.capsOn)
+            root.noteCaret();
+        if (root.atCaret)
+            root.updatePosition();
+        if (layoutPill.showing)
+            root.updateLayoutPosition();
+    }
+    onCyChanged: {
+        if (root.capsOn)
+            root.noteCaret();
+        if (root.atCaret)
+            root.updatePosition();
+        if (layoutPill.showing)
+            root.updateLayoutPosition();
+    }
+    onCwChanged: {
+        if (root.capsOn)
+            root.noteCaret();
+        if (root.atCaret)
+            root.updatePosition();
+        if (layoutPill.showing)
+            root.updateLayoutPosition();
+    }
+    onChChanged: {
+        if (root.capsOn)
+            root.noteCaret();
+        if (root.atCaret)
+            root.updatePosition();
+        if (layoutPill.showing)
+            root.updateLayoutPosition();
+    }
 
     function setCaps(on: bool) {
         if (on === root.capsOn)
             return;
         root.capsOn = on;
-        if (!on)
+        if (!on) {
+            root.resetArm();
             pill.hide();
+        } else {
+            // Preempt any layout flash. Strict first-key rule: the
+            // toggle arms nothing — not even a live caret. First
+            // keypress arms.
+            layoutTimer.stop();
+            layoutPill.hide();
+            root.resetArm();
+        }
+    }
+
+    function resetArm() {
+        root.armed = false;
+        root.armLive = false;
+    }
+
+    // Records live typing: rect->rect movement with a caret up arms.
+    // Arrivals (baseline null) only snapshot. Called on every caret
+    // step while caps is on.
+    function noteCaret() {
+        if (!root.hasCaret)
+            return;
+        if (root.armLive
+            && (root.cx !== root.armCx || root.cy !== root.armCy
+                || root.cw !== root.armCw || root.ch !== root.armCh))
+            root.armed = true;
+        root.armCx = root.cx;
+        root.armCy = root.cy;
+        root.armCw = root.cw;
+        root.armCh = root.ch;
+        root.armLive = true;
     }
 
     function monitorFor(x, y) {
@@ -123,12 +213,65 @@ ShellRoot {
     // the item's animations were ready at startup). show() restarts the
     // fade — fine here because transitions are rare, unlike the tick.
     function applyState() {
-        if (!root.capsOn || !root.hasCaret) {
+        if (!root.atCaret) {
             pill.hide();
             return;
         }
         root.updatePosition();
         pill.show();
+    }
+
+    // Layout flash (macOS input-source pill): 1 s at the caret on real
+    // layout switches. Same visibility rules (caret required), and the
+    // held caps pill wins conflicts. First value is the seed, not a
+    // switch — never flashes at startup.
+    function onLayoutSwitch() {
+        if (!root.seenLayout) {
+            root.seenLayout = true;
+            root.lastLayout = root.layout;
+            return;
+        }
+        if (root.layout === root.lastLayout || !root.layout)
+            return;
+        root.lastLayout = root.layout;
+        root.showLayoutFlash(root.layout);
+    }
+
+    // Flash appears exactly at the caret and stays there — snapped,
+    // never glided in from the last spot, never following. Preempts a
+    // showing caps pill (rule 1); the 1 s timer hands back to it.
+    function showLayoutFlash(name) {
+        if (!name || !root.hasCaret)
+            return;
+        layoutPill.text = name;
+        pill.hide();
+        lx.enabled = false;
+        ly.enabled = false;
+        root.updateLayoutPosition();
+        layoutPill.show();
+        layoutTimer.restart();
+        // Width settles a frame after the text change — recenter once,
+        // then re-enable follow glide.
+        Qt.callLater(function() {
+            if (layoutPill.showing)
+                root.updateLayoutPosition();
+            lx.enabled = true;
+            ly.enabled = true;
+        });
+    }
+
+    // Same placement as updatePosition but for the layout pill's own
+    // size. No fade touched; follows the caret while flashing.
+    function updateLayoutPosition() {
+        const mon = root.monitorFor(root.cx + root.cw / 2, root.cy);
+        let x = Math.round(root.cx + root.cw / 2 - layoutPill.implicitWidth / 2);
+        let y = Math.round(root.cy + root.ch + root.gap - layoutPill.margin);
+        if (y + layoutPill.implicitHeight > mon.y + mon.height)
+            y = Math.round(root.cy - root.gap - layoutPill.capsuleHeight - layoutPill.margin);
+        x = Math.max(mon.x, Math.min(mon.x + mon.width - layoutPill.implicitWidth, x));
+        y = Math.max(mon.y, Math.min(mon.y + mon.height - layoutPill.implicitHeight, y));
+        root.lpx = x;
+        root.lpy = y;
     }
 
     Timer {
@@ -138,6 +281,21 @@ ShellRoot {
         repeat: true
         triggeredOnStart: true
         onTriggered: pollProc.running = true
+    }
+
+    // Layout flash hold: 1 s like macOS, then fade out. Re-switching
+    // restarts it (no blink-through-hide). On expiry hands back to the
+    // caps pill if it still applies.
+    Timer {
+        id: layoutTimer
+        interval: 1000
+        running: false
+        repeat: false
+        onTriggered: {
+            layoutPill.hide();
+            if (root.atCaret)
+                pill.show();
+        }
     }
 
     Process {
@@ -195,6 +353,8 @@ ShellRoot {
             property int w: 0
             property int h: 0
             property int win: 0
+            property int age: -1
+            property string layout: ""
         }
     }
 
@@ -206,6 +366,16 @@ ShellRoot {
         function reveal() { root.showCalls++; pill.show(); }
         function hide() { root.hideCalls++; pill.hide(); }
         function poke() { root.pokeCalls++; pill.poke(); }
+        // Direct flash for switchers fcitx owns (the compositor layout
+        // event doesn't fire for fcitx-driven switches): same guards as
+        // the bus path — caret required, held caps wins.
+        function flashLayout(name: string) {
+            if (!name)
+                return;
+            root.seenLayout = true;
+            root.lastLayout = name;
+            root.showLayoutFlash(name);
+        }
         function debug(): string {
             return JSON.stringify({
                 capsOn: root.capsOn,
@@ -213,6 +383,10 @@ ShellRoot {
                 atCaret: root.atCaret,
                 cx: root.cx, cy: root.cy, cw: root.cw, ch: root.ch,
                 win: root.caretWin,
+                age: root.caretAge,
+                armed: root.armed,
+                layout: root.layout, lastLayout: root.lastLayout,
+                layoutShowing: layoutPill.showing,
                 px: root.px, py: root.py,
                 showing: pill.showing,
                 opacity: pill.opacity,
@@ -252,6 +426,26 @@ ShellRoot {
             }
             Behavior on y {
                 id: by
+                NumberAnimation {
+                    duration: 60
+                    easing.type: Easing.OutCubic
+                }
+            }
+        }
+
+        LayoutPill {
+            id: layoutPill
+            x: root.lpx
+            y: root.lpy
+            Behavior on x {
+                id: lx
+                NumberAnimation {
+                    duration: 60
+                    easing.type: Easing.OutCubic
+                }
+            }
+            Behavior on y {
+                id: ly
                 NumberAnimation {
                     duration: 60
                     easing.type: Easing.OutCubic

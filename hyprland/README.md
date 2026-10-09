@@ -5,9 +5,15 @@ is ON, placed **at the text caret** like macOS. Caps-only, no
 layout/num pills.
 
 - Shows while caps is ON (held), hides when it goes off
+- Layout flash: same capsule with the source label (`EN`), 1 s at the
+  caret on keyboard-layout switches (caret required, caps wins).
+  Toggle layouts with `layout-toggle.lua` (`Ctrl+Shift+Space`,
+  English <-> Arabic via fcitx5 — needs `keyboard-us` + `keyboard-ara`
+  in the fcitx5 Default group).
 - At-caret: centered on the caret, 6 px below (above when no room),
-  clamped to the monitor, smooth 120 ms follow
-- Re-pops when the focused window changes with caps still on (macOS-like)
+  clamped to the monitor, smooth follow with snap on large jumps
+- First-key arming: appears only after typing in the focused field,
+  never on the toggle or focus jump alone (per `DESIGN.md`)
 - Hides when no caret is known (off-field, desktop, XWayland) — same
   call as the KDE backend, no bottom-center fallback
 - Click-through overlay, 90ms fade in / 140ms fade out
@@ -82,6 +88,7 @@ Pill look in `CapsPill.qml`: `capsuleColor`, `inkColor`, sizes, timings.
 
 - `shell.qml` — layer-shell overlay, caret placement, caps polling, IPC
 - `CapsPill.qml` — the capsule (arrow-over-bar ⇪, shadow, fades)
+- `LayoutPill.qml` — same capsule with a source label (`EN`), 1 s flash
 - `caret-bridge/` — Hyprland plugin (sole caret source)
 - `capspill-hypr.py` — retired AT-SPI fallback (manual use only)
 - `run.sh` — launcher (overlay + best-effort plugin/fcitx5 start)

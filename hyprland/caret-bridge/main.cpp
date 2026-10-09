@@ -30,6 +30,7 @@
 #undef private
 
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -134,7 +135,7 @@ static std::chrono::steady_clock::time_point g_lastTitleChange{};
 
 static CHyprSignalListener s_newV1, s_newV3;
 static CHyprSignalListener s_kbFocus, s_winActive, s_wsActive, s_monFocused,
-    s_winClose, s_winTitle;
+    s_winClose, s_winTitle, s_kbLayout, s_mouseBtn;
 static wl_event_source* s_timer = nullptr;
 static uint64_t s_timerCount = 0;
 
@@ -143,6 +144,48 @@ static std::string g_lastJson;
 // focus changes so the overlay can re-pop (poke) event-driven instead
 // of polling `hyprctl activewindow`.
 static uint64_t g_winSeq = 0;
+// Typing freshness for the toggle-arm gate: the caps toggle counts as
+// a keypress only while the caret is live (a commit <2 s ago on the
+// focus client). Phantoms are silent; typing refreshes constantly.
+static long g_ageMs = -1;
+// Active keyboard layout, short pill form ("English" -> "EN").
+// Published in every state JSON; the overlay shows it 1 s on change,
+// at the caret, only where a caret is known (same rules as the pill).
+static std::string g_layout;
+
+static std::string shortLayout(const std::string& full) {
+    std::string w;
+    for (unsigned char c : full) {
+        if (c == ' ' || c == '(' || c == '+')
+            break;
+        w.push_back((char)c);
+    }
+    if (w.empty())
+        w = full;
+    std::string s;
+    for (unsigned char c : w) {
+        if (std::isalpha(c))
+            s.push_back((char)std::toupper(c));
+        if (s.size() >= 2)
+            break;
+    }
+    return s.empty() ? w.substr(0, 4) : s;
+}
+
+static std::string currentLayout() {
+    try {
+        for (auto& kb : g_pInputManager->m_keyboards) {
+            if (!kb)
+                continue;
+            std::string l = kb->getActiveLayout();
+            if (!l.empty())
+                return shortLayout(l);
+        }
+    } catch (...) {
+    }
+    return "";
+}
+
 // Last focused-window title: substantial renames mean navigation even
 // with a nearby commit (Ctrl-Tab right after typing); tiny mutations
 // (dirty `*` markers, counts) are typing churn and ignored.
@@ -202,9 +245,10 @@ static void publishNull(const std::string& why, const std::string& app) {
     char buf[384];
     std::snprintf(buf, sizeof(buf),
                   "{\"hasCaret\":false,\"x\":0,\"y\":0,\"w\":0,\"h\":0,"
-                  "\"why\":\"%s\",\"app\":\"%s\",\"win\":%llu}",
+                  "\"why\":\"%s\",\"app\":\"%s\",\"win\":%llu,\"layout\":\"%s\","
+                  "\"age\":%ld}",
                   why.c_str(), app.c_str(),
-                  (unsigned long long)g_winSeq);
+                  (unsigned long long)g_winSeq, g_layout.c_str(), g_ageMs);
     publish(buf);
 }
 
@@ -213,9 +257,10 @@ static void publishCaret(int x, int y, int w, int h, const std::string& why,
     char buf[384];
     std::snprintf(buf, sizeof(buf),
                   "{\"hasCaret\":true,\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,"
-                  "\"why\":\"%s\",\"app\":\"%s\",\"win\":%llu}",
+                  "\"why\":\"%s\",\"app\":\"%s\",\"win\":%llu,\"layout\":\"%s\","
+                  "\"age\":%ld}",
                   x, y, w, h, why.c_str(), app.c_str(),
-                  (unsigned long long)g_winSeq);
+                  (unsigned long long)g_winSeq, g_layout.c_str(), g_ageMs);
     publish(buf);
 }
 
@@ -258,6 +303,7 @@ static std::optional<CBox> surfaceBoxGlobal(const SP<CWLSurfaceResource>& surf) 
 static void probeAndPublish() {
     auto focusSurface = Desktop::focusState()->surface();
     const std::string app = focusApp();
+    g_ageMs = -1;
     if (!focusSurface) {
         publishNull("no_focus_surface", app);
         return;
@@ -353,6 +399,7 @@ static void probeAndPublish() {
     // client's objects. Gates the relay below (which carries no
     // timestamps of its own).
     auto clientMark = std::chrono::steady_clock::time_point{};
+    auto clientCommit = std::chrono::steady_clock::time_point{};
     // Surrounding-text identity for this client this probe: Gecko reuses
     // one text-input object across tabs, so a text replace without a
     // fresh box means the field changed (Ctrl-T), not typing.
@@ -368,6 +415,7 @@ static void probeAndPublish() {
             continue;
         sameClientV3++;
         clientMark = std::max({clientMark, t->lastCommit, t->lastEnable});
+        clientCommit = std::max(clientCommit, t->lastCommit);
         // Track surrounding text before looking at the box. m_current
         // keeps the last committed values, so compare content: a hash/len
         // change means new text even when the box didn't re-commit.
@@ -557,6 +605,7 @@ static void probeAndPublish() {
             continue;
         sameSurfV1++;
         clientMark = std::max(clientMark, t->lastCommit);
+        clientCommit = std::max(clientCommit, t->lastCommit);
         auto r = in->m_cursorRectangle;
         if (r.w <= 0 && r.h <= 0)
             continue;
@@ -575,9 +624,15 @@ static void probeAndPublish() {
         }
     }
 
+    if (clientCommit != std::chrono::steady_clock::time_point{}) {
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      now - clientCommit)
+                      .count();
+        g_ageMs = ms > 999999 ? 999999 : (long)ms;
+    }
+
     auto emitBox = [&](const CBox& c, const std::string& why) {
-        SCachedCaret cc;
-        cc.box = c;
+        SCachedCaret cc;        cc.box = c;
         cc.seenAt = now;
         cc.hasText = clientHasText;
         cc.textHash = clientTextHash;
@@ -944,6 +999,14 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO pluginInit(HANDLE handle) {
             ++g_winSeq;
             probeAndPublish();
         });
+    // Mouse press re-arms per interaction: clicking into a field moves
+    // the caret without any keypress, so the generation turns over and
+    // the arrival only snapshots (strict first-key rule).
+    s_mouseBtn = Event::bus()->m_events.input.mouse.button.listen(
+        [](IPointer::SButtonEvent, Event::SCallbackInfo&) {
+            ++g_winSeq;
+            probeAndPublish();
+        });
     s_winActive = Event::bus()->m_events.window.active.listen(
         [](PHLWINDOW, Desktop::eFocusReason) {
             ++g_winSeq;
@@ -965,6 +1028,15 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO pluginInit(HANDLE handle) {
         });
     s_winClose = Event::bus()->m_events.window.close.listen(
         [](PHLWINDOW) { probeAndPublish(); });
+    // Keyboard layout switch: refresh the published layout so the
+    // overlay can flash it. Event-driven, instant.
+    s_kbLayout = Event::bus()->m_events.input.keyboard.layout.listen(
+        [](SP<IKeyboard>, const std::string& name) {
+            std::string s = shortLayout(name);
+            if (!s.empty())
+                g_layout = s;
+            probeAndPublish();
+        });
     // Title change: substantial renames mean navigation even with a
     // nearby commit (Ctrl-Tab right after typing); tiny mutations are
     // typing churn and only count when isolated (no commit near them).
@@ -1016,6 +1088,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO pluginInit(HANDLE handle) {
             g_lastWinTitle = w->m_title;
     } catch (...) {
     }
+    g_layout = currentLayout();
     probeAndPublish();
 
     HyprlandAPI::addNotification(handle, "[macospills] caret-bridge loaded",
@@ -1033,11 +1106,13 @@ APICALL EXPORT void pluginExit() {
     s_newV1.reset();
     s_newV3.reset();
     s_kbFocus.reset();
+    s_mouseBtn.reset();
     s_winActive.reset();
     s_wsActive.reset();
     s_monFocused.reset();
     s_winClose.reset();
     s_winTitle.reset();
+    s_kbLayout.reset();
     if (s_timer) {
         wl_event_source_remove(s_timer);
         s_timer = nullptr;
