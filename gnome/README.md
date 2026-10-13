@@ -22,6 +22,21 @@ Needs ≥2 input sources (Settings → Keyboard → Input Sources) and a
 readable caps LED (`cat /sys/class/leds/*capslock/brightness`).
 
 ```bash
+./install.sh
+```
+
+That copies the extension into
+`~/.local/share/gnome-shell/extensions/`, compiles the schema
+(Ctrl+Shift+Space), removes the retired `layout-toggle.sh`
+media-keys binding, and enables the extension. It asks for your
+password only if it needs to install a missing dependency (`glib2`).
+
+Then **re-log** (Wayland has no shell restart; disable/enable does
+not reload extension code).
+
+Manual equivalent (if you don't want the script):
+
+```bash
 UUID=macospills@ali120b.github.io
 DST=~/.local/share/gnome-shell/extensions/$UUID
 rm -rf "$DST" && cp -r gnome/$UUID "$DST"
